@@ -182,9 +182,23 @@ Start/Stop Evil Twin
 
 Start/Stop Devil Twin
 
-Handshake Capture
+![Dashboard](./Images/Admin.png)
 
-PCAP Verifier
+
+Evil Twin Portal : 
+![Dashboard](./Images/Portal.png)
+
+Evil Twin Client Moniter :
+![Dashboard](./Images/Monniter.png)
+
+
+Handshake Capture :
+
+![Dashboard](./Images/Handshake.png)
+
+PCAP Verifier : 
+
+![Dashboard](./Images/PcapVerify.png)
 
 Network List
 Real-time SSID display
@@ -244,8 +258,6 @@ Orbitron by The League of Moveable Type (SIL Open Font License)
 Inspiration
 Cyberpunk 2077 aesthetic
 
-![Dashboard](./Images/Admin.png)
-![Dashboard](./Images/Handshake.png)
-![Dashboard](./Images/Monniter.png)
-![Dashboard](./Images/PcapVerify.png)
-![Dashboard](./Images/Portal.png)
+
+
+
