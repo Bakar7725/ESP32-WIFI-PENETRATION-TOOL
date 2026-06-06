@@ -157,6 +157,60 @@ pio device monitor --baud 115200
 
 ---
 
+## 📥 Flash Precompiled Firmware
+
+For users who do not want to compile the project, prebuilt firmware binaries are provided in the `build/` directory.
+
+### Included Files
+
+| File             | Flash Address | Description                      |
+| ---------------- | ------------- | -------------------------------- |
+| `bootloader.bin` | `0x1000`      | ESP32 bootloader                 |
+| `partitions.bin` | `0x8000`      | Partition table                  |
+| `firmware.bin`   | `0x10000`     | Main VENOME application firmware |
+
+---
+
+### Flash Using ESP Flash Download Tool
+
+1. Download and install the ESP Flash Download Tool.
+2. Connect your ESP32 via USB.
+3. Select **ESP32** as the target chip.
+4. Add the following files:
+
+| Address   | Binary File      |
+| --------- | ---------------- |
+| `0x1000`  | `bootloader.bin` |
+| `0x8000`  | `partitions.bin` |
+| `0x10000` | `firmware.bin`   |
+
+5. Select the correct COM port.
+6. Set the baud rate (recommended: `921600`).
+7. Click **START**.
+
+---
+
+### Flash Using esptool.py
+
+```bash
+esptool.py --chip esp32 --port COM3 --baud 921600 write_flash -z \
+0x1000 bootloader.bin \
+0x8000 partitions.bin \
+0x10000 firmware.bin
+```
+
+Replace `COM3` with your ESP32 serial port.
+
+---
+
+### Flash Using PlatformIO
+
+```bash
+pio run --target upload
+```
+
+---
+
 ## 🚀 First Boot
 
 Power on the ESP32.
