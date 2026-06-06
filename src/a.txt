@@ -1,0 +1,73 @@
+void performBackgroundScan()
+{
+    if (isVerifyingPassword)
+    {
+        Serial.println("Scan skipped - password verification in progress");
+        background_scan_in_progress = false;
+        last_scan_time = millis();
+        return;
+    }
+
+    if (!background_scanning_active || background_scan_in_progress)
+        return;
+
+    // Don't scan if deauth is active - it will interfere
+    if (deauthing_active && !devil_twin_active) {
+        background_scan_in_progress = false;
+        last_scan_time = millis();
+        return;
+    }
+
+    background_scan_in_progress = true;
+    Serial.println("Performing background scan...");
+
+    // Save current channel
+    uint8_t saved_channel;
+    esp_wifi_get_channel(&saved_channel, NULL);
+
+    // Stop deauth temporarily
+    bool wasDeauthActive = deauthing_active;
+    if (wasDeauthActive)
+    {
+        stop_deauth();
+        deauthing_active = false;
+        delay(100);
+    }
+
+    // Scan on all channels quickly
+    int foundNetworks = WiFi.scanNetworks(false, true, false, 300); // 300ms per channel
+    
+    if (devil_twin_active) {
+        // Search for target AP for Devil Twin mode
+        bool targetFound = false;
+        for (int i = 0; i < foundNetworks; i++)
+        {
+            String currentSSID = WiFi.SSID(i);
+            if (currentSSID == devil_target_ssid)
+            {
+                int newChannel = WiFi.channel(i);
+                Serial.printf("Target found on channel %d\n", newChannel);
+                devil_target_channel = newChannel;
+                targetFound = true;
+                break;
+            }
+        }
+        if (!targetFound) {
+            Serial.println("Target AP not found in background scan");
+        }
+    }
+
+    // Restore channel
+    esp_wifi_set_channel(saved_channel, WIFI_SECOND_CHAN_NONE);
+
+    // Restart deauth
+    if (wasDeauthActive)
+    {
+        delay(200);
+        deauthing_active = true;
+        attack_active = true;
+    }
+
+    background_scan_in_progress = false;
+    last_scan_time = millis();
+}

@@ -1,0 +1,1153 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VENOME PROJECT // CYBERPUNK EDITION</title>
+    <style>
+        @font-face {
+            font-family: 'Orbitron';
+            font-style: normal;
+            font-weight: 400;
+            src: url('/fonts/Orbitron-Regular.ttf') format('truetype');
+        }
+
+        @font-face {
+            font-family: 'Orbitron';
+            font-style: normal;
+            font-weight: 600;
+            src: url('/fonts/Orbitron-SemiBold.ttf') format('truetype');
+        }
+
+        @font-face {
+            font-family: 'Orbitron';
+            font-style: normal;
+            font-weight: 800;
+            src: url('/fonts/Orbitron-ExtraBold.ttf') format('truetype');
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0a0f1f;
+            color: #fff;
+            font-family: 'Orbitron', sans-serif;
+            min-height: 100vh;
+            padding: 20px;
+            position: relative;
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: '';
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at 20% 50%, rgba(255, 0, 255, 0.1) 0%, transparent 50%),
+                radial-gradient(circle at 80% 80%, rgba(0, 255, 255, 0.1) 0%, transparent 50%);
+            pointer-events: none;
+            z-index: -1;
+        }
+
+        .cyber-container {
+            max-width: 1400px;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        .neon-header {
+            background: rgba(10, 15, 31, 0.9);
+            border: 2px solid #ff00ff;
+            box-shadow: 0 0 20px #ff00ff, inset 0 0 20px rgba(255, 0, 255, 0.3);
+            padding: 25px;
+            margin-bottom: 25px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .neon-header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: linear-gradient(45deg, transparent 30%, rgba(255, 0, 255, 0.1) 50%, transparent 70%);
+            animation: cyberGlow 6s linear infinite;
+        }
+
+        @keyframes cyberGlow {
+            0% {
+                transform: translateX(-100%) translateY(-100%) rotate(45deg);
+            }
+
+            100% {
+                transform: translateX(100%) translateY(100%) rotate(45deg);
+            }
+        }
+
+        .glitch-text {
+            font-size: 2.5em;
+            font-weight: 800;
+            text-transform: uppercase;
+            position: relative;
+            text-shadow: 0.05em 0 0 #ff00ff, -0.05em -0.025em 0 #00ffff;
+            animation: glitch 3s infinite;
+        }
+
+        @keyframes glitch {
+
+            0%,
+            100% {
+                text-shadow: 0.05em 0 0 #ff00ff, -0.05em -0.025em 0 #00ffff;
+            }
+
+            25% {
+                text-shadow: -0.05em -0.025em 0 #ff00ff, 0.025em 0.05em 0 #00ffff;
+            }
+
+            50% {
+                text-shadow: 0.025em 0.05em 0 #ff00ff, 0.05em 0 0 #00ffff;
+            }
+
+            75% {
+                text-shadow: -0.025em 0 0 #ff00ff, -0.025em -0.05em 0 #00ffff;
+            }
+        }
+
+        .subtitle {
+            color: #00ffff;
+            text-shadow: 0 0 10px #00ffff;
+            letter-spacing: 3px;
+            margin-top: 10px;
+        }
+
+        .status-bar {
+            background: rgba(10, 15, 31, 0.9);
+            border: 2px solid #00ffff;
+            box-shadow: 0 0 20px #00ffff, inset 0 0 20px rgba(0, 255, 255, 0.2);
+            padding: 15px 25px;
+            margin-bottom: 25px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 30px;
+            position: relative;
+            backdrop-filter: blur(5px);
+        }
+
+        .status-bar span {
+            color: #00ffff;
+            text-shadow: 0 0 10px #00ffff;
+            font-size: 1.1em;
+        }
+
+        .status-bar .blink {
+            color: #ff00ff;
+            text-shadow: 0 0 10px #ff00ff;
+        }
+
+        .blink {
+            animation: blink 1s infinite;
+        }
+
+        @keyframes blink {
+
+            0%,
+            50% {
+                opacity: 1;
+            }
+
+            51%,
+            100% {
+                opacity: 0.5;
+            }
+        }
+
+        .switch-btn {
+            background: transparent;
+            border: 2px solid #ff0000;
+            color: #ff0000;
+            padding: 15px 20px;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1.2em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 0 20px rgba(255, 0, 0, 0.3);
+            width: 100%;
+            margin-bottom: 25px;
+            position: relative;
+            overflow: hidden;
+            z-index: 1;
+        }
+
+        .switch-btn:hover {
+            background: #ff0000;
+            color: #0a0f1f;
+            box-shadow: 0 0 30px #ff0000;
+        }
+
+        .switch-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+            transition: left 0.5s ease-in-out;
+            z-index: -1;
+        }
+
+        .switch-btn:hover::before {
+            left: 100%;
+        }
+
+        .cyber-card {
+            background: rgba(10, 15, 31, 0.9);
+            border: 2px solid #00ffff;
+            box-shadow: 0 0 20px #00ffff, inset 0 0 20px rgba(0, 255, 255, 0.2);
+            padding: 25px;
+            margin-bottom: 25px;
+            position: relative;
+            backdrop-filter: blur(5px);
+        }
+
+        .card-title {
+            color: #ff00ff;
+            font-size: 1.3em;
+            letter-spacing: 3px;
+            margin-bottom: 20px;
+            text-transform: uppercase;
+            border-bottom: 1px solid #ff00ff;
+            padding-bottom: 10px;
+            text-shadow: 0 0 10px #ff00ff;
+        }
+
+        .cyber-table {
+            border: 2px solid #ff00ff;
+            box-shadow: 0 0 20px rgba(255, 0, 255, 0.3);
+            margin-bottom: 25px;
+            overflow-x: auto;
+            overflow-y: auto;
+            /* 👈 YEH ADD KARO */
+            max-height: 400px;
+            /* 👈 YEH ADD KARO - jitni height chahiye */
+            width: 100%;
+        }
+
+        .cyber-table th {
+            position: sticky;
+            top: 0;
+            background: rgba(10, 15, 31, 0.95);
+            /* Background color */
+            z-index: 10;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            min-width: 600px;
+        }
+
+        th {
+            text-align: left;
+            padding: 15px 10px;
+            border-bottom: 2px solid #ff00ff;
+            color: #00ffff;
+            font-weight: 600;
+            font-size: 0.9em;
+            letter-spacing: 1px;
+            background: rgba(255, 0, 255, 0.1);
+        }
+
+        td {
+            padding: 12px 10px;
+            border-bottom: 1px solid rgba(255, 0, 255, 0.3);
+            color: #fff;
+            font-size: 0.85em;
+        }
+
+        tr:hover td {
+            background: rgba(255, 0, 255, 0.1);
+            cursor: pointer;
+        }
+
+        tr.selected {
+            background: rgba(0, 255, 255, 0.1);
+            border-left: 4px solid #00ffff;
+        }
+
+        tr.selected td {
+            color: #00ffff;
+        }
+
+        fieldset {
+            border: 2px solid #ff00ff;
+            padding: 25px;
+            margin: 20px 0;
+            position: relative;
+            background: rgba(10, 15, 31, 0.9);
+        }
+
+        legend {
+            color: #00ffff;
+            font-weight: 600;
+            padding: 0 15px;
+            border: 2px solid #ff00ff;
+            background: #0a0f1f;
+            font-size: 1.1em;
+            letter-spacing: 2px;
+            text-shadow: 0 0 10px #00ffff;
+        }
+
+        .cyber-input {
+            background: transparent;
+            border: 2px solid #00ffff;
+            color: #00ffff;
+            padding: 10px 15px;
+            font-family: 'Orbitron', monospace;
+            font-size: 1em;
+            width: 120px;
+            margin-left: 10px;
+            box-shadow: 0 0 10px rgba(0, 255, 255, 0.3);
+        }
+
+        .cyber-input:focus {
+            outline: none;
+            box-shadow: 0 0 20px #00ffff;
+        }
+
+        label {
+            color: #ff00ff;
+            font-size: 1em;
+            letter-spacing: 1px;
+        }
+
+        .cyber-btn {
+            background: transparent;
+            border: 2px solid #00ffff;
+            color: #00ffff;
+            padding: 12px 24px;
+            font-family: 'Orbitron', sans-serif;
+            font-size: 1em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            cursor: pointer;
+            transition: all 0.3s;
+            box-shadow: 0 0 15px rgba(0, 255, 255, 0.3);
+            position: relative;
+            overflow: hidden;
+            z-index: 1;
+        }
+
+        .cyber-btn:hover {
+            background: #00ffff;
+            color: #0a0f1f;
+            box-shadow: 0 0 30px #00ffff;
+        }
+
+        .cyber-btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
+            transition: left 0.5s ease-in-out;
+            z-index: -1;
+        }
+
+        .cyber-btn:hover::before {
+            left: 100%;
+        }
+
+        .btn-neon-pink {
+            border-color: #ff00ff;
+            color: #ff00ff;
+            box-shadow: 0 0 15px rgba(255, 0, 255, 0.3);
+        }
+
+        .btn-neon-pink:hover {
+            background: #ff00ff;
+            color: #0a0f1f;
+        }
+
+        #errors {
+            background: rgba(255, 0, 0, 0.2);
+            border: 2px solid #ff0000;
+            box-shadow: 0 0 20px rgba(255, 0, 0, 0.3);
+            color: #ff0000;
+            padding: 15px;
+            margin: 20px 0;
+            font-size: 1em;
+            text-align: center;
+            text-shadow: 0 0 10px #ff0000;
+        }
+
+        #loading,
+        #running {
+            text-align: center;
+            padding: 50px;
+            border: 2px solid #ffff00;
+            box-shadow: 0 0 30px #ffff00;
+            margin: 30px 0;
+        }
+
+        #loading span,
+        #running span {
+            color: #ffff00;
+            font-size: 1.5em;
+            text-shadow: 0 0 15px #ffff00;
+        }
+
+        #running-progress {
+            color: #ffff00;
+            font-size: 2em;
+            display: block;
+            margin-top: 20px;
+            text-shadow: 0 0 20px #ffff00;
+        }
+
+        #result-meta {
+            background: rgba(0, 255, 255, 0.1);
+            border: 2px solid #00ffff;
+            padding: 20px;
+            margin-bottom: 20px;
+            color: #00ffff;
+            font-size: 1.1em;
+            line-height: 2;
+        }
+
+        #result-content {
+            background: rgba(10, 15, 31, 0.9);
+            border: 2px solid #ff00ff;
+            padding: 25px;
+            margin: 20px 0;
+            overflow-x: auto;
+        }
+
+        code {
+            background: #1a1f2f;
+            color: #00ff00;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-family: monospace;
+            border: 1px solid #00ff00;
+        }
+
+        pre {
+            background: #1a1f2f;
+            border: 2px solid #00ffff;
+            padding: 20px;
+            overflow-x: auto;
+            color: #00ff00;
+            font-family: monospace;
+            margin: 15px 0;
+        }
+
+        a {
+            color: #00ffff;
+            text-decoration: none;
+            border: 2px solid #00ffff;
+            padding: 10px 20px;
+            display: inline-block;
+            margin: 10px 0;
+            transition: all 0.3s;
+            text-shadow: 0 0 10px #00ffff;
+        }
+
+        a:hover {
+            background: #00ffff;
+            color: #0a0f1f;
+            box-shadow: 0 0 20px #00ffff;
+        }
+
+        .footer {
+            text-align: center;
+            padding: 25px;
+            border-top: 2px solid #ff00ff;
+            margin-top: 30px;
+            color: #00ffff;
+        }
+
+        .footer-glow {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-top: 15px;
+            color: #888;
+        }
+
+        .footer-glow span {
+            text-shadow: 0 0 10px currentColor;
+        }
+
+        .footer-glow span:nth-child(1) {
+            color: #ff00ff;
+        }
+
+        .footer-glow span:nth-child(2) {
+            color: #00ffff;
+        }
+
+        .footer-glow span:nth-child(3) {
+            color: #ffff00;
+        }
+
+        @media (max-width: 768px) {
+            .glitch-text {
+                font-size: 1.3em;
+            }
+
+            .subtitle {
+                font-size: 0.8em;
+                letter-spacing: 2px;
+            }
+
+            .status-bar {
+                flex-direction: column;
+                gap: 10px;
+                padding: 12px 15px;
+            }
+
+            .status-bar span {
+                font-size: 0.9em;
+            }
+
+            .switch-btn {
+                font-size: 1em;
+                padding: 12px 15px;
+            }
+
+            .cyber-card {
+                padding: 15px;
+            }
+
+            .card-title {
+                font-size: 1.1em;
+                letter-spacing: 2px;
+            }
+
+            .cyber-table {
+                max-height: 250px;
+                /* Mobile par chhoti height */
+            }
+
+            /* Target Selection Section Fixes */
+            fieldset {
+                padding: 15px;
+                margin: 10px 0;
+            }
+
+            legend {
+                font-size: 0.9em;
+                padding: 0 10px;
+            }
+
+            /* Make table mobile-friendly */
+            .cyber-table {
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+                margin: 10px 0;
+                border-width: 1px;
+            }
+
+            table {
+                min-width: 100%;
+                width: 100%;
+                font-size: 0.8em;
+            }
+
+            th {
+                padding: 10px 5px;
+                font-size: 0.8em;
+                white-space: nowrap;
+            }
+
+            td {
+                padding: 8px 5px;
+                font-size: 0.75em;
+                word-break: break-word;
+            }
+
+            /* Specific column widths for mobile */
+            th:first-child,
+            td:first-child {
+                max-width: 120px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }
+
+            th:nth-child(2),
+            td:nth-child(2) {
+                max-width: 100px;
+                font-family: monospace;
+                font-size: 0.7em;
+            }
+
+            th:last-child,
+            td:last-child {
+                max-width: 60px;
+                text-align: right;
+            }
+
+            /* Attack parameters section */
+            fieldset:last-of-type {
+                padding: 15px;
+            }
+
+            fieldset:last-of-type div {
+                flex-direction: column;
+                align-items: stretch !important;
+                gap: 12px !important;
+            }
+
+            fieldset:last-of-type label {
+                font-size: 0.9em;
+                text-align: center;
+            }
+
+            .cyber-input {
+                width: 100%;
+                margin: 5px 0;
+                padding: 12px;
+                font-size: 1em;
+            }
+
+            .cyber-btn {
+                width: 100%;
+                padding: 12px 15px;
+                font-size: 0.9em;
+                margin: 5px 0;
+            }
+
+            .btn-neon-pink {
+                width: 100%;
+            }
+
+            /* Loading and running sections */
+            #loading,
+            #running {
+                padding: 30px 15px;
+                margin: 15px 0;
+            }
+
+            #loading span,
+            #running span {
+                font-size: 1.2em;
+            }
+
+            #running-progress {
+                font-size: 1.5em;
+            }
+
+            /* Result section */
+            #result-meta {
+                padding: 15px;
+                font-size: 0.9em;
+                line-height: 1.6;
+            }
+
+            #result-content {
+                padding: 15px;
+            }
+
+            pre {
+                padding: 10px;
+                font-size: 0.7em;
+            }
+
+            code {
+                padding: 2px 5px;
+                font-size: 0.7em;
+            }
+
+            a {
+                padding: 8px 15px;
+                font-size: 0.9em;
+                width: 100%;
+                text-align: center;
+            }
+
+            .footer {
+                padding: 20px 10px;
+                font-size: 0.8em;
+            }
+
+            .footer-glow {
+                flex-direction: column;
+                gap: 10px;
+            }
+
+            .footer-glow span {
+                font-size: 0.8em;
+            }
+
+            /* Error messages */
+            #errors {
+                padding: 12px;
+                font-size: 0.9em;
+            }
+        }
+
+        /* Extra small devices */
+        @media (max-width: 480px) {
+            .glitch-text {
+                font-size: 1.1em;
+            }
+
+            th {
+                font-size: 0.7em;
+                padding: 8px 3px;
+            }
+
+            td {
+                font-size: 0.65em;
+                padding: 6px 3px;
+            }
+
+            th:first-child,
+            td:first-child {
+                max-width: 100px;
+            }
+
+            th:nth-child(2),
+            td:nth-child(2) {
+                max-width: 80px;
+            }
+
+            .card-title {
+                font-size: 1em;
+            }
+
+            legend {
+                font-size: 0.8em;
+            }
+
+            .cyber-btn {
+                font-size: 0.8em;
+                padding: 10px 12px;
+            }
+        }
+    </style>
+</head>
+
+<body onLoad="getStatus()">
+    <div class="cyber-container">
+        <div class="neon-header">
+            <div class="glitch-text">HANDSHAKE CAPTURE</div>
+            <div class="subtitle">CYBERPUNK EDITION v2.0 </div>
+        </div>
+
+        <div class="status-bar">
+            <span class="blink">&#128308; PROTOCOL: VENOME</span>
+            <span>&#9889; STATUS: <span id="system-status">ONLINE</span></span>
+            <span>&#128274; ENCRYPTION: AES-256</span>
+        </div>
+
+        <button onclick="switchPacketWifi()" class="switch-btn">
+            &#128682; VENOME v1
+        </button>
+        <button onclick="switchVenomeVerifier()" class="switch-btn"
+            style="margin-top: 10px; border-color: #ff00ff; color: #ff00ff;">
+            &#128187; PCAP VERIFER
+        </button>
+
+        <section id="errors" style="display: none;"></section>
+
+        <section id="loading" style="display: none;">
+            <span class="blink">&#8987; LOADING... PLEASE WAIT</span>
+        </section>
+
+        <section id="ready" style="display: none;">
+            <div class="cyber-card">
+                <div class="card-title">&#128296; ATTACK CONFIGURATION</div>
+                <form onSubmit="runAttack(); return false;">
+                    <fieldset>
+                        <legend>&#127968; SELECT TARGET</legend>
+                        <div class="cyber-table">
+                            <table id="ap-list"></table>
+                        </div>
+                        <div style="text-align: center; margin-top: 20px;">
+                            <button type="button" onClick="refreshAps()" class="cyber-btn btn-neon-pink">
+                                &#128260; REFRESH SCAN
+                            </button>
+                        </div>
+                    </fieldset>
+
+                    <fieldset>
+                        <legend>&#9881; ATTACK PARAMETERS</legend>
+                        <div
+                            style="display: flex; align-items: center; justify-content: center; gap: 20px; flex-wrap: wrap;">
+                            <label for="attack_timeout">&#9201; TIMEOUT (seconds):</label>
+                            <input type="number" min="0" max="255" id="attack_timeout" value="60" required
+                                class="cyber-input" />
+                            <button type="submit" class="cyber-btn">&#9760; LAUNCH ATTACK</button>
+                        </div>
+                    </fieldset>
+                </form>
+            </div>
+        </section>
+
+        <section id="running" style="display: none;">
+            <div class="cyber-card">
+                <div class="card-title">&#8987; ATTACK IN PROGRESS</div>
+                <div style="text-align: center;">
+                    <span>Time elapsed: <span id="running-progress" class="blink"></span></span>
+                </div>
+            </div>
+        </section>
+
+        <section id="result" style="display: none;">
+            <div class="cyber-card">
+                <div class="card-title">&#128200; ATTACK RESULT</div>
+                <div id="result-meta"></div>
+                <div id="result-content"></div>
+                <div style="text-align: center; margin-top: 20px;">
+                    <button type="button" onClick="resetAttack()" class="cyber-btn btn-neon-pink">
+                        &#128257; INITIATE NEW ATTACK
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <div class="footer">
+            <div>VENOME CYBERPUNK EDITION // PROTOCOL: SECURE</div>
+            <div class="footer-glow">
+                <span>&#9889; QUANTUM CORE</span>
+                <span>&#128481; AES-256</span>
+                <span>&#128260; DEEP SCAN</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        var AttackStateEnum = { READY: 0, RUNNING: 1, FINISHED: 2, TIMEOUT: 3 };
+        var AttackTypeEnum = { ATTACK_TYPE_PASSIVE: 0, ATTACK_TYPE_HANDSHAKE: 1, ATTACK_TYPE_PMKID: 2, ATTACK_TYPE_DOS: 3 };
+        var selectedApElement = -1;
+        var poll;
+        var poll_interval = 1000;
+        var running_poll;
+        var running_poll_interval = 1000;
+        var attack_timeout = 0;
+        var time_elapsed = 0;
+        var defaultResultContent = document.getElementById("result") ? document.getElementById("result").innerHTML : "";
+
+        function getStatus() {
+            var oReq = new XMLHttpRequest();
+            oReq.onload = function () {
+                var arrayBuffer = oReq.response;
+                if (arrayBuffer) {
+                    var attack_state = parseInt(new Uint8Array(arrayBuffer, 0, 1));
+                    var attack_type = parseInt(new Uint8Array(arrayBuffer, 1, 1));
+                    var attack_content_size = parseInt(new Uint16Array(arrayBuffer, 2, 1));
+                    var attack_content = new Uint8Array(arrayBuffer, 4);
+                    console.log("attack_state=" + attack_state + "; attack_type=" + attack_type + "; attack_count_size=" + attack_content_size);
+
+                    hideAllSections();
+
+                    switch (attack_state) {
+                        case AttackStateEnum.READY:
+                            showAttackConfig();
+                            break;
+                        case AttackStateEnum.RUNNING:
+                            showRunning();
+                            setTimeout(getStatus, poll_interval);
+                            break;
+                        case AttackStateEnum.FINISHED:
+                            showResult("FINISHED", attack_type, attack_content_size, attack_content);
+                            break;
+                        case AttackStateEnum.TIMEOUT:
+                            showResult("TIMEOUT", attack_type, attack_content_size, attack_content);
+                            break;
+                        default:
+                            document.getElementById("errors").style.display = "block";
+                            document.getElementById("errors").innerHTML = "&#9888; ERROR: Unknown attack status!";
+                    }
+                    return;
+                }
+            };
+            oReq.onerror = function () {
+                console.log("Request error");
+                document.getElementById("errors").style.display = "block";
+                document.getElementById("errors").innerHTML = "&#9888; Cannot reach ESP32. Check connection.";
+                setTimeout(getStatus, 3000);
+            };
+            oReq.ontimeout = function () {
+                console.log("Request timeout");
+                getStatus();
+            };
+            oReq.open("GET", "/status", true);
+            oReq.responseType = "arraybuffer";
+            oReq.send();
+        }
+
+        function hideAllSections() {
+            var sections = document.getElementsByTagName("section");
+            for (let i = 0; i < sections.length; i++) {
+                sections[i].style.display = "none";
+            }
+        }
+        function switchVenomeVerifier() {
+            var oReq = new XMLHttpRequest();
+            oReq.open("GET", "/switchVenomeVerifier", true);
+            oReq.send();
+
+            document.getElementById("errors").style.display = "block";
+            document.getElementById("errors").innerHTML = "&#9989; PCAP Verifier... Please wait.";
+
+        }
+
+
+
+        function showRunning() {
+            hideAllSections();
+            document.getElementById("running").style.display = "block";
+            document.getElementById("loading").style.display = "none";
+        }
+
+        function countProgress() {
+            if (time_elapsed >= attack_timeout) {
+                document.getElementById("errors").style.display = "block";
+                document.getElementById("errors").innerHTML = "&#9888; Attack timeout - Please reconnect";
+                clearInterval(running_poll);
+            }
+            document.getElementById("running-progress").innerHTML = time_elapsed + "/" + attack_timeout + "s";
+            time_elapsed++;
+        }
+
+        function showAttackConfig() {
+            document.getElementById("ready").style.display = "block";
+            document.getElementById("loading").style.display = "none";
+            refreshAps();
+        }
+
+        function showResult(status, attack_type, attack_content_size, attack_content) {
+            hideAllSections();
+            clearInterval(poll);
+            document.getElementById("result").innerHTML = defaultResultContent;
+            document.getElementById("result").style.display = "block";
+            document.getElementById("result-meta").innerHTML = "&#128200; STATUS: " + status + "<br>";
+
+            var type = "ERROR: Cannot parse attack type.";
+            switch (attack_type) {
+                case AttackTypeEnum.ATTACK_TYPE_PASSIVE:
+                    type = "PASSIVE";
+                    break;
+                case AttackTypeEnum.ATTACK_TYPE_HANDSHAKE:
+                    type = "HANDSHAKE";
+                    resultHandshake(attack_content, attack_content_size);
+                    break;
+                case AttackTypeEnum.ATTACK_TYPE_PMKID:
+                    type = "PMKID";
+                    resultPmkid(attack_content, attack_content_size);
+                    break;
+                case AttackTypeEnum.ATTACK_TYPE_DOS:
+                    type = "DOS";
+                    break;
+                default:
+                    type = "UNKNOWN";
+            }
+            document.getElementById("result-meta").innerHTML += "&#127919; TYPE: " + type + "<br>";
+        }
+
+        function refreshAps() {
+            document.getElementById("ap-list").innerHTML = "<tr><td colspan='3' style='text-align: center; color: #ffff00;'>&#8987; LOADING NETWORKS... (this may take a while)</td></tr>";
+
+            var oReq = new XMLHttpRequest();
+            oReq.onload = function () {
+                var header = "<tr><th>SSID</th><th>BSSID</th><th>RSSI</th></tr>";
+                document.getElementById("ap-list").innerHTML = header;
+
+                var arrayBuffer = oReq.response;
+                if (arrayBuffer) {
+                    var byteArray = new Uint8Array(arrayBuffer);
+                    for (let i = 0; i < byteArray.byteLength; i = i + 40) {
+                        var tr = document.createElement('tr');
+                        tr.setAttribute("id", i / 40);
+                        tr.setAttribute("onClick", "selectAp(this)");
+
+                        var td_ssid = document.createElement('td');
+                        var td_bssid = document.createElement('td');
+                        var td_rssi = document.createElement('td');
+
+                        // Decode SSID (32 bytes)
+                        var ssidBytes = byteArray.subarray(i + 0, i + 32);
+                        var ssid = "";
+                        for (let j = 0; j < 32; j++) {
+                            if (ssidBytes[j] > 0) {
+                                ssid += String.fromCharCode(ssidBytes[j]);
+                            }
+                        }
+                        td_ssid.innerHTML = ssid || "[HIDDEN]";
+
+                        // Format BSSID (6 bytes)
+                        for (let j = 0; j < 6; j++) {
+                            td_bssid.innerHTML += uint8ToHex(byteArray[i + 33 + j]);
+                            if (j < 5) td_bssid.innerHTML += ":";
+                        }
+
+                        // RSSI (1 byte)
+                        td_rssi.innerHTML = byteArray[i + 39] - 255;
+
+                        tr.appendChild(td_ssid);
+                        tr.appendChild(td_bssid);
+                        tr.appendChild(td_rssi);
+
+                        document.getElementById("ap-list").appendChild(tr);
+                    }
+                }
+            };
+
+            oReq.onerror = function () {
+                document.getElementById("ap-list").innerHTML = "<tr><td colspan='3' style='color: #ff0000; text-align: center;'>&#10060; ERROR loading APs</td></tr>";
+            };
+
+            oReq.open("GET", "/ap-list", true);
+            oReq.responseType = "arraybuffer";
+            oReq.send();
+        }
+
+        function selectAp(el) {
+            console.log("Selected AP ID: " + el.id);
+            if (selectedApElement != -1 && selectedApElement) {
+                selectedApElement.classList.remove("selected");
+            }
+            selectedApElement = el;
+            el.classList.add("selected");
+        }
+
+        function runAttack() {
+            if (selectedApElement == -1 || !selectedApElement) {
+                console.log("No AP selected. Attack not started.");
+                document.getElementById("errors").style.display = "block";
+                document.getElementById("errors").innerHTML = "&#9888; No AP selected. Attack not started.";
+                return;
+            }
+
+            hideAllSections();
+            document.getElementById("running").style.display = "block";
+            document.getElementById("loading").style.display = "none";
+
+            var arrayBuffer = new ArrayBuffer(4);
+            var uint8Array = new Uint8Array(arrayBuffer);
+            uint8Array[0] = parseInt(selectedApElement.id);
+            uint8Array[1] = 1; // ATTACK_TYPE_HANDSHAKE
+            uint8Array[2] = 0; // ATTACK_HANDSHAKE_METHOD_ROGUE_AP
+            uint8Array[3] = parseInt(document.getElementById("attack_timeout").value);
+
+            var oReq = new XMLHttpRequest();
+            oReq.open("POST", "/run-attack", true);
+            oReq.send(arrayBuffer);
+
+            getStatus();
+
+            attack_timeout = parseInt(document.getElementById("attack_timeout").value);
+            time_elapsed = 0;
+            running_poll = setInterval(countProgress, running_poll_interval);
+        }
+
+        function resetAttack() {
+            hideAllSections();
+            showAttackConfig();
+
+            var oReq = new XMLHttpRequest();
+            oReq.open("HEAD", "/reset", true);
+            oReq.send();
+        }
+
+        function resultPmkid(attack_content, attack_content_size) {
+            var mac_ap = "";
+            var mac_sta = "";
+            var ssid = "";
+            var ssid_text = "";
+            var pmkid = "";
+            var index = 0;
+
+            for (let i = 0; i < 6; i++) {
+                mac_ap += uint8ToHex(attack_content[index + i]);
+            }
+            index += 6;
+
+            for (let i = 0; i < 6; i++) {
+                mac_sta += uint8ToHex(attack_content[index + i]);
+            }
+            index += 6;
+
+            var ssid_len = attack_content[index];
+            index++;
+            for (let i = 0; i < ssid_len; i++) {
+                ssid += uint8ToHex(attack_content[index + i]);
+                ssid_text += String.fromCharCode(attack_content[index + i]);
+            }
+            index += ssid_len;
+
+            var pmkid_cnt = 0;
+            for (let i = 0; i < attack_content_size - index; i++) {
+                if ((i % 16) == 0) {
+                    pmkid += "<br>";
+                    pmkid += "</code>PMKID #" + pmkid_cnt + ": <code>";
+                    pmkid_cnt++;
+                }
+                pmkid += uint8ToHex(attack_content[index + i]);
+            }
+
+            document.getElementById("result-content").innerHTML = "";
+            document.getElementById("result-content").innerHTML += "&#128273; MAC AP: <code>" + mac_ap + "</code><br>";
+            document.getElementById("result-content").innerHTML += "&#128241; MAC STA: <code>" + mac_sta + "</code><br>";
+            document.getElementById("result-content").innerHTML += "&#128225; SSID: <code>" + ssid + "</code> (" + ssid_text + ")<br>";
+            document.getElementById("result-content").innerHTML += "<code>" + pmkid + "</code><br>";
+            document.getElementById("result-content").innerHTML += "<br>&#9889; Hashcat ready format:<br>";
+            document.getElementById("result-content").innerHTML += "<code>" + pmkid + "*" + mac_ap + "*" + mac_sta + "*" + ssid + "</code><br>";
+        }
+
+        function resultHandshake(attack_content, attack_content_size) {
+            document.getElementById("result-content").innerHTML = "";
+
+            var pcap_link = document.createElement("a");
+            pcap_link.setAttribute("href", "/capture.pcap");
+            pcap_link.innerHTML = "&#128229; DOWNLOAD PCAP FILE";
+
+            document.getElementById("result-content").innerHTML += "<p>" + pcap_link.outerHTML + "</p>";
+
+            var handshakes = "";
+            for (let i = 0; i < attack_content_size; i++) {
+                handshakes += uint8ToHex(attack_content[i]);
+                if (i % 50 == 49) {
+                    handshakes += "\n";
+                }
+            }
+
+            if (handshakes.length > 0) {
+                document.getElementById("result-content").innerHTML += "<pre><code>" + handshakes + "</code></pre>";
+            }
+        }
+
+        function uint8ToHex(uint8) {
+            return ("00" + uint8.toString(16)).slice(-2).toUpperCase();
+        }
+
+        function switchPacketWifi() {
+            var oReq = new XMLHttpRequest();
+            oReq.open("GET", "/switchPacketWifi", true);
+            oReq.send();
+
+            document.getElementById("errors").style.display = "block";
+            document.getElementById("errors").innerHTML = "&#9989; Switching to VENOME v1... Please wait.";
+        }
+    </script>
+</body>
+
+</html>
