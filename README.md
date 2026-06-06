@@ -244,10 +244,8 @@ Orbitron by The League of Moveable Type (SIL Open Font License)
 Inspiration
 Cyberpunk 2077 aesthetic
 
-Wi-Fi penetration testing community
-
-ESP32 Deauther project
-
-/result	POST	Password verification endpoint
-/handshake	POST	Switch to handshake capture
-/venomeverifies	POST	Switch to PCAP verifier
+![Dashboard](./Images/Admin.png)
+![Dashboard](./Images/Handshake.png)
+![Dashboard](./Images/Monniter.png)
+![Dashboard](./Images/PcapVerify.png)
+![Dashboard](./Images/Portal.png)
