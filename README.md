@@ -1,263 +1,382 @@
-ESP32 Wi-Fi Penetration Tool - VENOME Cyberpunk Edition
+# ⚡ VENOME Cyberpunk Edition ⚡
 
-🎯 Overview
-VENOME Cyberpunk Edition is a professional-grade Wi-Fi security assessment tool for ESP32, designed for penetration testing and security research. It combines multiple attack vectors with a stunning cyberpunk-themed web interface for comprehensive wireless network auditing.
+<div align="center">
 
-🔥 Key Features
-Feature	Description
-Evil Twin Attack	Clone legitimate APs to capture credentials
-Devil Twin Attack	Advanced AP cloning with constant-rate deauthentication
-4-Way Handshake Capture	Capture and analyze WPA/WPA2 handshakes
-PCAP Verifier	Analyze captured handshakes for cracking readiness
-Deauthentication Attack	Disconnect clients from target networks
-Background Scanning	Automatic channel tracking for roaming APs
-Real-time Monitoring	Live dashboard with client tracking
-PCAp Export	Hashcat-compatible handshake format
+# VENOME Cyberpunk Edition
 
-🛠️ Hardware Requirements
-Component	Specification
-Microcontroller	ESP32 (DOIT DevKit V1 recommended)
-Flash Size	4MB minimum (16MB recommended)
-USB Cable	Data-capable USB cable
-Antenna	Integrated PCB or external (for better range)
-Power Source	USB or 5V battery pack
-Compatible ESP32 Boards
-ESP32 DOIT DevKit V1 ✅
+### Professional ESP32 Wi-Fi Security Assessment Framework
 
-ESP32-WROOM-32 ✅
+![ESP32](https://img.shields.io/badge/ESP32-Compatible-00ff9f?style=for-the-badge)
+![PlatformIO](https://img.shields.io/badge/PlatformIO-6.1+-ff0080?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-7.0_Cyberpunk-00e5ff?style=for-the-badge)
+![Framework](https://img.shields.io/badge/Framework-Arduino-ffcc00?style=for-the-badge)
 
-ESP32-WROVER ✅
+</div>
 
-NodeMCU-32S ✅
+---
 
-LOLIN32 ✅
+## 🎯 Overview
 
-percentage
+**VENOME Cyberpunk Edition** is a professional-grade ESP32 Wi-Fi security assessment platform developed for wireless security research, penetration testing, and educational purposes.
 
+The framework combines multiple Wi-Fi auditing capabilities with a cyberpunk-inspired web interface, providing real-time monitoring, wireless reconnaissance, handshake collection, and network assessment functionality.
 
+---
 
+## 🖼️ Screenshots
 
-💻 Software Requirements
-Development Environment
-bash
-PlatformIO IDE
-  - Version: 6.1.0+
-  - Platform: espressif32
-  - Framework: Arduino
-Dependencies
-ini
+### Admin Dashboard
+
+![Admin Dashboard](./Images/Admin.png)
+
+---
+
+### Evil Twin Portal
+
+![Portal](./Images/Portal.png)
+
+---
+
+### Client Monitor
+
+![Monitor](./Images/Moniter.png)
+
+---
+
+### Handshake Capture
+
+![Handshake](./Images/Handshake.png)
+
+---
+
+### PCAP Verifier
+
+![PCAP Verifier](./Images/PcapVerify.png)
+
+---
+
+## 🔥 Features
+
+| Feature                       | Description                                          |
+| ----------------------------- | ---------------------------------------------------- |
+| ⚡ Deauthentication Attack     | Disconnect clients from target access points         |
+| 👿 Devil Twin Attack          | Advanced AP cloning with continuous deauthentication |
+| 🏠 Evil Twin Attack           | Clone legitimate APs for security assessment         |
+| 🔒 WPA/WPA2 Handshake Capture | Capture and analyze authentication handshakes        |
+| 📡 PCAP Verifier              | Verify handshake integrity and cracking readiness    |
+| 📊 Real-Time Monitoring       | Monitor connected clients and activity               |
+| 🎯 Background Scanning        | Automatic channel tracking and AP monitoring         |
+| 💾 Hashcat Export             | Export captures in Hashcat-compatible formats        |
+| 🌐 Web Interface              | Modern cyberpunk-themed control panel                |
+| 📈 Live Statistics            | Memory usage, uptime, and attack monitoring          |
+
+---
+
+## 🛠️ Hardware Requirements
+
+| Component         | Specification          |
+| ----------------- | ---------------------- |
+| Microcontroller   | ESP32                  |
+| Recommended Board | ESP32 DOIT DevKit V1   |
+| Flash Size        | 4MB Minimum            |
+| Recommended Flash | 16MB                   |
+| USB Cable         | Data-Capable USB       |
+| Antenna           | Internal or External   |
+| Power Supply      | USB or 5V Battery Pack |
+
+### Supported Boards
+
+* ✅ ESP32 DOIT DevKit V1
+* ✅ ESP32-WROOM-32
+* ✅ ESP32-WROVER
+* ✅ NodeMCU-32S
+* ✅ LOLIN32
+
+---
+
+## 💻 Software Requirements
+
+### Development Environment
+
+* PlatformIO IDE 6.1+
+* Arduino Framework
+* Python 3.7+
+* Git
+
+### Required Libraries
+
+```ini
 [env:esp32doit-devkit-v1]
+
 platform = espressif32
 board = esp32doit-devkit-v1
 framework = arduino
+
 lib_deps =
     ESP32Async/ESPAsyncWebServer
     ESP32Async/AsyncTCP
-System Requirements
-PlatformIO Core (or VSCode + PlatformIO Extension)
+```
 
-Python 3.7+
+### Drivers
 
-Git
+Install the appropriate USB driver:
 
-USB-to-UART drivers (CP210x, CH340, or FTDI)
+* CP210x
+* CH340
+* FTDI
 
-📦 Installation
-1. Clone the Repository
-bash
+---
+
+## 📦 Installation
+
+### Clone Repository
+
+```bash
 git clone https://github.com/Bakar7725/ESP32-WIFI-PENETRATION-TOOL.git
+
 cd ESP32-WIFI-PENETRATION-TOOL
-2. Build and Upload with PlatformIO
-bash
-# Build the project
+```
+
+### Build Firmware
+
+```bash
 pio run
+```
 
-# Upload to ESP32
+### Upload Firmware
+
+```bash
 pio run --target upload
+```
 
-# Monitor serial output
+### Serial Monitor
+
+```bash
 pio device monitor --baud 115200
-🎮 Usage Guide
-First Boot
-Power on ESP32 - LED indicators will show boot status
+```
 
-Connect to AP - Scan for VENOME v1 (Password: Venome@kali)
+---
 
-Note :
-SSID :  VENOME v1 Password : Venome@kali
-SSID :  VENOME v2 Password : Venome@kali
-SSID :  VENOME v3 Password : Venome@kali
+## 🚀 First Boot
 
-Access Web Interface - Navigate to http://192.168.4.1
+Power on the ESP32.
 
-Main Dashboard Features
-Network Scanning
-Click SCAN NETWORKS to discover nearby APs
+Connect to one of the following wireless networks:
 
-Networks display:
+| SSID      | Password    |
+| --------- | ----------- |
+| VENOME v1 | Venome@kali |
+| VENOME v2 | Venome@kali |
+| VENOME v3 | Venome@kali |
 
-SSID (name)
+Open:
 
-Channel
+```text
+http://192.168.4.1
+```
 
-Signal strength (dBm with visual bars)
+---
 
-Security type (OPEN/WPA/WPA2/WPA3)
+## 🌐 Web Interface
 
-Approximate range
+| Interface       | URL                        |
+| --------------- | -------------------------- |
+| Main Portal     | http://192.168.4.1         |
+| Admin Dashboard | http://192.168.4.1/admin   |
+| Client Monitor  | http://192.168.4.1/moniter |
 
-Target Selection
-Click any network row to select target
+---
 
-Selected target shows detailed information
+## 📊 Dashboard Features
 
-Signal strength displayed with percentage
+### Network Scanner
 
-Available Attacks
-Attack	Button	Description
-Deauth	⚡ START DEAUTH	Disconnect clients from target AP
-Evil Twin	🏠 START EVIL TWIN	Clone AP with credential capture portal
-Devil Twin	👿 START DEVIL TWIN	Advanced attack with constant deauth + fake AP
-Handshake Capture	🔒 HANDSHAKE CAPTURE	Capture 4-way handshake for cracking
-PCAP Verifier	📡 PCAP VERIFIER	Analyze captured handshakes
-🎯 Attack Modes
-1. Deauthentication Attack
-yaml
-Type: Denial of Service
-Purpose: Disconnect clients from target network
-Method: Send forged deauth frames to broadcast address
-Rate: 50 packets/second (configurable)
-Use Case: Force clients to reconnect (capture handshake)
-2. Evil Twin Attack
-yaml
-Type: Credential Harvesting
-Purpose: Clone legitimate AP to capture passwords
-Method: 
-  - Create identical SSID
-  - Host captive portal
-  - Forward credentials (optional)
-Use Case: Phishing Wi-Fi credentials
-3. Devil Twin Attack
-yaml
-Type: Combined Attack
-Purpose: Force reconnection + Credential capture
-Method:
-  - Clone target AP
-  - Send constant deauth packets
-  - Background channel scanning
-Rate: 50 packets/sec (deauth)
-Use Case: Aggressive handshake capture
-4. Constant Rate Attack (New)
-yaml
-Type: High-intensity Deauth
-Purpose: Maximum disruption without fake AP
-Method:
-  - NO fake AP (stealthy)
-  - Constant packet rate
-  - Background scanning only
-Rate: 50 packets/sec CONSTANT
-Use Case: Testing without credential capture
-🌐 Web Interface
-Access Points
-Interface	URL	Description
-Main Portal	http://192.168.4.1	Evil twin captive portal
-Admin Panel	http://192.168.4.1/admin	Attack control dashboard
-Monitor	http://192.168.4.1/moniter	Real-time monitoring
-Admin Panel Features
-Statistics Dashboard
-Uptime counter
+Displays:
 
-Free heap memory
+* SSID
+* Channel
+* Security Type
+* Signal Strength
+* Estimated Distance
 
-Active attack status
+### Target Selection
 
-Current target info
+Provides:
 
-Control Buttons
-Scan Networks
+* Signal Percentage
+* Channel Information
+* Security Status
+* Attack Availability
 
-Start/Stop Deauth
+### Monitoring
 
-Start/Stop Evil Twin
+Tracks:
 
-Start/Stop Devil Twin
+* Connected Clients
+* Unique Devices
+* Password Attempts
+* Client History
+* Attack Status
 
-![Dashboard](./Images/Admin.png)
+---
 
+## 🎯 Assessment Modules
 
-Evil Twin Portal : 
-![Dashboard](./Images/Portal.png)
+### ⚡ Deauthentication
 
-Evil Twin Client Moniter :
-![Dashboard](./Images/Monniter.png)
+**Purpose**
 
+Disconnect clients from a selected access point.
 
-Handshake Capture :
+**Method**
 
-![Dashboard](./Images/Handshake.png)
+Broadcast deauthentication frames.
 
-PCAP Verifier : 
+**Use Case**
 
-![Dashboard](./Images/PcapVerify.png)
+Trigger client reconnection events.
 
-Network List
-Real-time SSID display
+---
 
-Signal strength bars
+### 🏠 Evil Twin
 
-Security indicators (🔓/🔒)
+**Purpose**
 
-One-click selection
+Clone target access points for security awareness testing.
 
-Monitor Dashboard
-text
-[ MONITOR DASHBOARD ]
-├── Current connected clients
-├── Total unique clients
-├── Password attempts (real-time)
-├── Client history
-└── Attack status indicators
-📡 API Reference
-Web Endpoints (PacketWiFi Mode)
-Endpoint	Method	Description
-/	GET	Evil twin portal page
-/admin	GET	Admin control panel
-/moniter	GET	Monitoring dashboard
+**Capabilities**
 
-⚖️ Legal Disclaimer
-text
-THIS SOFTWARE IS PROVIDED FOR EDUCATIONAL PURPOSES ONLY.
+* Duplicate SSID
+* Captive Portal
+* Credential Collection Interface
 
-By using this software, you agree that:
-1. You will only test networks you own or have written permission to test
-2. You understand the laws regarding Wi-Fi security testing in your jurisdiction
-3. The author assumes NO liability for misuse or damage
-4. Unauthorized access to computer systems is illegal
-5. You will use this tool responsibly and ethically
+---
 
-Violation of these terms may result in:
-- Civil liability
-- Criminal prosecution
-- Termination of service agreements
-🎨 Credits
-Development
-Author: Bakar7725
+### 👿 Devil Twin
 
-Version: 7.0 Cyberpunk Edition
+**Purpose**
 
-Libraries
-ESPAsyncWebServer - ESP32 Async Web Server
+Combine AP cloning with continuous client disconnection.
 
-AsyncTCP - Async TCP Library
+**Capabilities**
 
-PlatformIO - Build System
+* Fake Access Point
+* Continuous Deauthentication
+* Background Scanning
 
-Fonts
-Orbitron by The League of Moveable Type (SIL Open Font License)
+---
 
-Inspiration
-Cyberpunk 2077 aesthetic
+### 🔒 Handshake Capture
 
+**Purpose**
 
+Capture WPA/WPA2 authentication handshakes.
 
+**Features**
 
+* Real-Time Collection
+* Export Support
+* Verification Integration
+
+---
+
+### 📡 PCAP Verifier
+
+**Purpose**
+
+Verify capture quality before analysis.
+
+**Features**
+
+* Handshake Detection
+* Integrity Validation
+* Export Verification
+
+---
+
+## 📡 API Endpoints
+
+| Endpoint        | Method | Description              |
+| --------------- | ------ | ------------------------ |
+| /               | GET    | Captive Portal           |
+| /admin          | GET    | Dashboard                |
+| /moniter        | GET    | Monitoring Interface     |
+| /result         | POST   | Credential Verification  |
+| /handshake      | POST   | Enable Handshake Capture |
+| /venomeverifies | POST   | Enable PCAP Verification |
+
+---
+
+## 📁 Project Structure
+
+```text
+ESP32-WIFI-PENETRATION-TOOL
+│
+├── Images
+│   ├── Admin.png
+│   ├── Portal.png
+│   ├── Moniter.png
+│   ├── Handshake.png
+│   └── PcapVerify.png
+│
+├── src
+├── include
+├── data
+├── platformio.ini
+└── README.md
+```
+
+---
+
+## ⚠️ Legal Notice
+
+This software is provided strictly for:
+
+* Education
+* Security Research
+* Authorized Penetration Testing
+
+Users must:
+
+* Own the target network, or
+* Have explicit written authorization
+
+Unauthorized access to computer networks may violate local, state, national, or international laws.
+
+The author assumes no responsibility for misuse.
+
+---
+
+## 🎨 Credits
+
+### Author
+
+**Bakar7725**
+
+### Version
+
+**VENOME Cyberpunk Edition v7.0**
+
+### Technologies
+
+* ESP32
+* PlatformIO
+* Arduino Framework
+* ESPAsyncWebServer
+* AsyncTCP
+
+### Inspiration
+
+* Cyberpunk 2077
+* ESP32 Security Research Community
+* Wireless Penetration Testing Projects
+
+---
+
+<div align="center">
+
+### ⚡ VENOME Cyberpunk Edition ⚡
+
+Professional Wi-Fi Security Assessment Framework for ESP32
+
+</div>
