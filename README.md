@@ -1,12 +1,5 @@
 ESP32 Wi-Fi Penetration Tool - VENOME Cyberpunk Edition
-<div align="center">
-https://img.shields.io/badge/version-7.0-red
-https://img.shields.io/badge/platform-ESP32-blue
-https://img.shields.io/badge/framework-Arduino-cyan
-https://img.shields.io/badge/license-MIT-green
-https://img.shields.io/badge/style-Cyberpunk-magenta
 
-</div>
 🎯 Overview
 VENOME Cyberpunk Edition is a professional-grade Wi-Fi security assessment tool for ESP32, designed for penetration testing and security research. It combines multiple attack vectors with a stunning cyberpunk-themed web interface for comprehensive wireless network auditing.
 
@@ -41,93 +34,7 @@ LOLIN32 ✅
 
 percentage
 
-🔄 VENOME MODES
-VENOME operates in three distinct modes, each with its own access point configuration:
 
-Mode 1: VENOME v1 - Main Attack Interface
-text
-┌─────────────────────────────────────────────────────┐
-│  SSID: VENOME v1                                    │
-│  Password: Venome@kali                              │
-│  IP: 192.168.4.1                                    │
-│  Purpose: Main attack dashboard                     │
-│  Features:                                          │
-│    - Evil Twin Attack                               │
-│    - Devil Twin Attack                              │
-│    - Deauthentication Attack                        │
-│    - Real-time Monitoring                           │
-└─────────────────────────────────────────────────────┘
-Mode 2: VENOME v2 - Handshake Capture
-text
-┌─────────────────────────────────────────────────────┐
-│  SSID: VENOME v2                                    │
-│  Password: Venome@kali                              │
-│  IP: 192.168.4.1                                    │
-│  Purpose: 4-Way Handshake Capture                   │
-│  Features:                                          │
-│    - Professional handshake capture                 │
-│    - Monitor mode enabled                           │
-│    - PCAP format export                             │
-│    - Hashcat compatible (hccapx)                    │
-└─────────────────────────────────────────────────────┘
-How to access:
-
-From VENOME v1 admin panel
-
-Click HANDSHAKE CAPTURE button
-
-ESP32 restarts as VENOME v2
-
-Reconnect to VENOME v2 (password: Venome@kali)
-
-Access http://192.168.4.1
-
-Mode 3: VENOME v3 - PCAP Verifier
-text
-┌─────────────────────────────────────────────────────┐
-│  SSID: VENOME v3                                    │
-│  Password: Venome@kali                              │
-│  IP: 192.168.4.1                                    │
-│  Purpose: Handshake Analysis & Verification         │
-│  Features:                                          │
-│    - Upload PCAP files (max 45KB)                   │
-│    - Detect M1, M2, M3, M4 messages                 │
-│    - Analyze handshake completeness                 │
-│    - Ready for hashcat verification                 │
-└─────────────────────────────────────────────────────┘
-How to access:
-
-From VENOME v1 admin panel
-
-Click PCAP VERIFIER button
-
-ESP32 restarts as VENOME v3
-
-Reconnect to VENOME v3 (password: Venome@kali)
-
-Access http://192.168.4.1
-
-Mode Switching Flow
-text
-                    ┌─────────────────┐
-                    │   VENOME v1     │
-                    │  Attack Mode    │
-                    └────────┬────────┘
-                             │
-            ┌────────────────┼────────────────┐
-            │                │                │
-            ▼                ▼                ▼
-    ┌───────────┐    ┌───────────┐    ┌───────────┐
-    │   Stay    │    │  Switch   │    │  Switch   │
-    │  VENOME   │    │    to     │    │    to     │
-    │    v1     │    │ VENOME v2 │    │ VENOME v3 │
-    └───────────┘    └─────┬─────┘    └─────┬─────┘
-                           │                │
-                           ▼                ▼
-                    ┌───────────┐    ┌───────────┐
-                    │ Handshake │    │   PCAP    │
-                    │ Capture   │    │ Verifier  │
-                    └───────────┘    └───────────┘
 
 
 💻 Software Requirements
